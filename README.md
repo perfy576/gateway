@@ -154,6 +154,8 @@ sudo systemctl restart gateway
 
 C++ 只监听 `127.0.0.1:19090`。公网不可暴露 `/internal/*`。Caddy 管理端口保持原配置，仅本机可达。配置变更通过管理 API 保存时立即更新内存；直接修改 MySQL 后需要重启网关。
 
+数据库连接空闲超过 1 秒后，再次使用前会检查连接；连接错误按 MySQL 错误码识别，每次操作最多重连 3 次。SQL 或权限错误不重连。事务内断线或 SQL 已开始执行时直接报错，不自动重放，避免重复写入或部分提交。间隔计时使用封装的 C API `clock_gettime(CLOCK_MONOTONIC)`。配置好数据库环境变量后，可运行 `make test-db` 验证空闲超时恢复、主动断连恢复、错误码分类、事务断线和重连次数上限；测试只调整自身连接的超时时间，测试写入会随事务回滚。
+
 该腾讯云 MySQL 实例当前 `have_ssl=DISABLED`。因此运行配置显式设置 `DB_TLS_REQUIRED=false`，数据库链路目前不加密。已为应用创建仅限 `gateway` 库的 DML 账号，应用不使用 root。启用腾讯云 SSL 后，配置 `DB_TLS_REQUIRED=true` 和 `DB_TLS_CA=/path/to/ca.pem`，会要求 TLS 并验证服务器证书；然后重启服务。
 
 新实例先使用管理员客户端配置执行 `node tools/init-db.mjs /path/to/admin.cnf` 来创建数据库、表和专用账号。Node 仅用于初始化及测试，不参与线上运行。现有实例不要重复执行初始化以免生成无用账号；线上环境配置已经安装。

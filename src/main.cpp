@@ -738,7 +738,7 @@ static void safely(WFHttpTask *task) {
     catch (const json::exception&) { respond_error(task,400,"字段格式无效"); }
     catch (const std::invalid_argument&) { respond_error(task,400,"请求参数或登录凭据无效"); }
     catch (const DbError& e) {
-        std::cerr<<"database: "<<e.what()<<'\n'; reset_db();
+        std::cerr<<"database: code="<<e.code()<<" "<<e.what()<<'\n'; reset_db();
         respond_error(task,503,"数据库暂时不可用，请稍后重试");
     }
     catch (const std::exception& e) {

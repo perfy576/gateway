@@ -25,15 +25,18 @@ include $(ROOT)/mk/workflow.mk
 APP_OBJECTS := $(addprefix $(BUILD_DIR)/obj/,src/main.o src/db.o src/security.o src/protocol.o)
 EXAMPLE_OBJECT := $(BUILD_DIR)/obj/examples/backend-verify.o
 TEST_OBJECT := $(BUILD_DIR)/obj/tests/security.o
+DB_TEST_OBJECT := $(BUILD_DIR)/obj/tests/db.o
 SECURITY_OBJECTS := $(BUILD_DIR)/obj/src/security.o $(BUILD_DIR)/obj/src/protocol.o
-OBJECTS := $(APP_OBJECTS) $(EXAMPLE_OBJECT) $(TEST_OBJECT)
+OBJECTS := $(APP_OBJECTS) $(EXAMPLE_OBJECT) $(TEST_OBJECT) $(DB_TEST_OBJECT)
 
-.PHONY: all deps examples test check install clean help
+.PHONY: all deps examples test check test-db install clean help
 all: $(BUILD_DIR)/gateway
 deps: $(JWT_READY) $(WORKFLOW_READY)
 examples: $(BUILD_DIR)/backend-verify
 test check: $(BUILD_DIR)/gateway-security-tests $(BUILD_DIR)/backend-verify
 	$(BUILD_DIR)/gateway-security-tests
+test-db: $(BUILD_DIR)/gateway-db-tests
+	$(BUILD_DIR)/gateway-db-tests
 
 $(JWT_READY): $(ROOT)/tools/fetch-source.sh $(ROOT)/Makefile
 	$(SHELL) $(ROOT)/tools/fetch-source.sh https://github.com/Thalhammer/jwt-cpp.git $(JWT_REVISION) $(JWT_CPP_SRC)
@@ -43,6 +46,7 @@ $(JWT_READY): $(ROOT)/tools/fetch-source.sh $(ROOT)/Makefile
 $(BUILD_DIR)/obj/src/main.o: APP_CPPFLAGS += -isystem $(WORKFLOW_INCLUDE) $(MARIADB_CFLAGS)
 $(BUILD_DIR)/obj/src/main.o: $(WORKFLOW_HEADERS_READY)
 $(BUILD_DIR)/obj/src/db.o: APP_CPPFLAGS += $(MARIADB_CFLAGS)
+$(DB_TEST_OBJECT): APP_CPPFLAGS += $(MARIADB_CFLAGS)
 
 $(BUILD_DIR)/obj/%.o: $(ROOT)/%.cpp $(ROOT)/Makefile $(JWT_READY)
 	mkdir -p $(@D)
@@ -57,16 +61,19 @@ $(BUILD_DIR)/backend-verify: $(EXAMPLE_OBJECT) $(SECURITY_OBJECTS)
 $(BUILD_DIR)/gateway-security-tests: $(TEST_OBJECT) $(SECURITY_OBJECTS)
 	$(CXX) $(CXXFLAGS) $(LDFLAGS) -o $@ $^ $(OPENSSL_LIBS) -pthread $(LDLIBS)
 
+$(BUILD_DIR)/gateway-db-tests: $(DB_TEST_OBJECT) $(BUILD_DIR)/obj/src/db.o
+	$(CXX) $(CXXFLAGS) $(LDFLAGS) -o $@ $^ -Wl,--wrap=mysql_real_connect $(MARIADB_LIBS) -pthread $(LDLIBS)
+
 install: all
 	install -d $(DESTDIR)$(PREFIX)/bin
 	install -m 0755 $(BUILD_DIR)/gateway $(DESTDIR)$(PREFIX)/bin/gateway
 
 clean:
 	$(RM) $(OBJECTS) $(OBJECTS:.o=.d) $(WORKFLOW_OBJECTS) $(WORKFLOW_OBJECTS:.o=.d)
-	$(RM) $(BUILD_DIR)/gateway $(BUILD_DIR)/backend-verify $(BUILD_DIR)/gateway-security-tests $(WORKFLOW_LIBRARY)
+	$(RM) $(BUILD_DIR)/gateway $(BUILD_DIR)/backend-verify $(BUILD_DIR)/gateway-security-tests $(BUILD_DIR)/gateway-db-tests $(WORKFLOW_LIBRARY)
 	$(RM) $(JWT_READY) $(WORKFLOW_READY) $(WORKFLOW_HEADERS_READY)
 
 help:
-	@printf '%s\n' 'make -j2       Build the gateway and pinned dependencies' 'make test      Build and run security tests' 'make examples  Build the backend verifier example' 'make install   Install the binary; supports PREFIX and DESTDIR' 'make clean     Remove build products; retain downloaded sources' 'Overrides: BUILD_DIR DEPS_DIR WORKFLOW_SRC JWT_CPP_SRC CC CXX CPPFLAGS CFLAGS CXXFLAGS LDFLAGS LDLIBS'
+	@printf '%s\n' 'make -j2       Build the gateway and pinned dependencies' 'make test      Build and run security tests' 'make test-db   Run connection recovery tests; requires configured MySQL' 'make examples  Build the backend verifier example' 'make install   Install the binary; supports PREFIX and DESTDIR' 'make clean     Remove build products; retain downloaded sources' 'Overrides: BUILD_DIR DEPS_DIR WORKFLOW_SRC JWT_CPP_SRC CC CXX CPPFLAGS CFLAGS CXXFLAGS LDFLAGS LDLIBS'
 
 -include $(OBJECTS:.o=.d) $(WORKFLOW_OBJECTS:.o=.d)
