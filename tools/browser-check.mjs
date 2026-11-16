@@ -1,0 +1,84 @@
+import assert from 'node:assert/strict';
+import {readFileSync,writeFileSync} from 'node:fs';
+import {createRequire} from 'node:module';
+const require=createRequire(import.meta.url);
+const {chromium}=require(process.env.PLAYWRIGHT_MODULE || '/home/ubuntu/.npm/_npx/e41f203b7505f1fb/node_modules/playwright');
+const origin='https://gateway.perfy576.com';
+const credentialRecord=readFileSync('.secrets/initial-admin.txt','utf8');
+const adminUsername=credentialRecord.match(/^Username: (.+)$/m)[1];
+const password=credentialRecord.match(/^Password: (.+)$/m)[1];
+const browser=await chromium.launch({headless:true,executablePath:process.env.CHROMIUM_PATH,args:['--no-sandbox']});
+const errors=[];
+const context=await browser.newContext({viewport:{width:1440,height:1000},locale:'zh-CN'});
+const page=await context.newPage();
+page.on('pageerror',error=>errors.push(error.message));
+page.on('console',message=>{if(message.type()==='error' && !message.text().includes('status of 401'))errors.push(message.text());});
+async function noOverflow(label) {
+  const result=await page.evaluate(()=>({width:innerWidth,scroll:document.documentElement.scrollWidth}));
+  assert(result.scroll<=result.width,`${label} horizontal overflow: ${JSON.stringify(result)}`);
+}
+let serviceId;
+try {
+  await page.goto(origin+'/');await page.getByRole('heading',{name:'Gateway',exact:true}).waitFor();assert.equal(await page.locator('input').count(),0);await page.screenshot({path:'artifacts/home-desktop.png',fullPage:true});
+  await page.goto(origin+'/admin');await page.getByRole('heading',{name:'管理后台登录'}).waitFor();
+  await noOverflow('desktop login');await page.screenshot({path:'artifacts/login-desktop.png',fullPage:true});
+  await page.getByLabel('用户名',{exact:true}).fill(adminUsername);await page.getByLabel('密码',{exact:true}).fill(password);
+  await page.getByRole('button',{name:'显示密码',exact:true}).click();assert.equal(await page.locator('#f-password').getAttribute('type'),'text');
+  assert.equal(new URL(page.url()).pathname,'/admin');
+  await page.getByRole('button',{name:'隐藏密码',exact:true}).click();
+  await page.getByRole('button',{name:'登录',exact:true}).click();await page.getByRole('heading',{name:'域名与服务',exact:true}).waitFor();
+  await page.goto(origin+'/admin');await page.getByRole('heading',{name:'域名与服务',exact:true}).waitFor();
+  await noOverflow('desktop admin');await page.screenshot({path:'artifacts/admin-desktop.png',fullPage:true});
+  await page.getByRole('button',{name:'添加域名',exact:true}).first().click();
+  await page.getByLabel('服务名称').fill('浏览器测试服务');await page.getByLabel('AppID',{exact:true}).fill('gateway-browser');await page.getByLabel('接入域名').fill('gateway-browser.invalid');
+  await page.getByLabel('后端地址').fill('http://127.0.0.1:19091');await page.getByLabel('免登录路径').fill('/healthz\n/assets/*');
+  await page.getByRole('button',{name:'保存',exact:true}).click();await page.locator('#modal').waitFor({state:'hidden'});
+  await page.getByRole('cell',{name:'浏览器测试服务',exact:false}).waitFor();
+  serviceId=await page.evaluate(async()=>{const data=await fetch('/api/admin/state').then(r=>r.json());return data.services.find(s=>s.host==='gateway-browser.invalid').id;});
+  await page.screenshot({path:'artifacts/admin-populated-desktop.png',fullPage:true});
+  await page.getByRole('button',{name:'编辑服务',exact:true}).click();
+  await page.getByLabel('服务名称').fill('已更新的测试服务');await page.getByLabel('免登录路径').fill('/ready\n/public/*');
+  await page.getByRole('button',{name:'保存',exact:true}).click();await page.locator('#modal').waitFor({state:'hidden'});
+  await page.getByRole('cell',{name:'已更新的测试服务',exact:false}).waitFor();
+  await page.getByRole('button',{name:'后端签名密钥',exact:true}).click();
+  await page.getByRole('heading',{name:'后端签名密钥',exact:true}).waitFor();assert.equal((await page.locator('#secret-value').textContent()).length,64);
+  assert.equal((await page.locator('#verification-key-value').textContent()).length,64);
+  assert.equal(await page.locator('#appid-value').textContent(),'gateway-browser');
+  const previousSecret=await page.locator('#secret-value').textContent();
+  await page.getByRole('button',{name:'更换 Secret',exact:true}).click();
+  await page.getByRole('button',{name:'确认轮换',exact:true}).click();
+  await page.getByRole('heading',{name:'后端签名密钥',exact:true}).waitFor();
+  assert.notEqual(await page.locator('#secret-value').textContent(),previousSecret);
+  assert.equal(await page.locator('#appid-value').textContent(),'gateway-browser');
+  await page.setViewportSize({width:320,height:700});await noOverflow('small mobile secret dialog');
+  assert(await page.locator('#modal').evaluate(el=>el.scrollWidth<=el.clientWidth));
+  await page.screenshot({path:'artifacts/sdk-credentials-mobile.png',fullPage:true});await page.setViewportSize({width:1440,height:1000});
+  await page.getByRole('button',{name:'关闭',exact:true}).click();
+  await page.getByRole('button',{name:'用户管理',exact:true}).click();await page.getByRole('heading',{name:'用户管理',exact:true}).waitFor();
+  await page.getByRole('button',{name:'添加用户',exact:true}).click();assert.equal(await page.locator('select').count(),0);
+  const dropdown=page.getByRole('combobox',{name:'角色'});await dropdown.click();await page.getByRole('option',{name:'管理员',exact:true}).click();assert.equal(await page.locator('gw-select').evaluate(el=>el.value),'admin');
+  await dropdown.press('ArrowUp');await dropdown.press('Enter');assert.equal(await page.locator('gw-select').evaluate(el=>el.value),'user');
+  await page.screenshot({path:'artifacts/custom-components-desktop.png',fullPage:true});await page.getByRole('button',{name:'关闭',exact:true}).click();
+  await page.screenshot({path:'artifacts/users-desktop.png',fullPage:true});
+  await page.getByRole('button',{name:'在线会话',exact:true}).click();await page.getByRole('heading',{name:'在线会话',exact:true}).waitFor();
+  await page.getByRole('button',{name:'审计日志',exact:true}).click();await page.getByRole('heading',{name:'审计日志',exact:true}).waitFor();
+  await page.getByRole('button',{name:'账号安全',exact:true}).click();await page.getByRole('heading',{name:'账号安全',exact:true}).waitFor();
+  await page.getByRole('button',{name:'域名与服务',exact:true}).click();
+  await page.setViewportSize({width:390,height:844});await noOverflow('mobile admin');
+  await page.screenshot({path:'artifacts/admin-mobile.png',fullPage:true});
+  await page.getByRole('button',{name:'添加域名',exact:true}).first().click();await noOverflow('mobile dialog');
+  await page.screenshot({path:'artifacts/service-dialog-mobile.png',fullPage:true});await page.getByRole('button',{name:'关闭',exact:true}).click();
+  await page.getByRole('button',{name:'打开导航',exact:true}).click();await page.getByRole('button',{name:'用户管理',exact:true}).click();
+  await page.getByRole('heading',{name:'用户管理',exact:true}).waitFor();await noOverflow('mobile users');
+  const cleared=await page.evaluate(async id=>{
+    const me=await fetch('/api/me').then(r=>r.json());const r=await fetch('/api/admin/services/'+id,{method:'DELETE',headers:{'Content-Type':'application/json','X-Gateway-Request':'1','X-CSRF-Token':me.csrf},body:'{}'});return r.status;
+  },serviceId);assert.equal(cleared,200);serviceId=null;
+  await context.clearCookies();await page.goto(origin+'/admin');await page.getByRole('heading',{name:'管理后台登录'}).waitFor();
+  await noOverflow('mobile login');await page.screenshot({path:'artifacts/login-mobile.png',fullPage:true});
+  assert.deepEqual(errors,[]);console.log('PASS browser login, password visibility, service create/edit/delete, secret retrieval, all admin views, desktop/mobile layout and dialogs; no JS/CSP errors');
+} finally {
+  if(serviceId)await page.evaluate(async id=>{
+    const me=await fetch('/api/me').then(r=>r.json());await fetch('/api/admin/services/'+id,{method:'DELETE',headers:{'Content-Type':'application/json','X-Gateway-Request':'1','X-CSRF-Token':me.csrf},body:'{}'});
+  },serviceId).catch(()=>{});
+  writeFileSync('artifacts/browser-errors.json',JSON.stringify(errors,null,2));await browser.close();
+}

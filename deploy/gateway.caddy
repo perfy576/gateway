@@ -1,0 +1,92 @@
+gateway.perfy576.com {
+    encode zstd gzip
+    header Strict-Transport-Security "max-age=31536000"
+    @private path /internal/* /_gateway/*
+    respond @private 404
+    request_body {
+        max_size 128KB
+    }
+    reverse_proxy 127.0.0.1:19090
+}
+
+(gateway_application) {
+    header Strict-Transport-Security "max-age=31536000"
+
+    @gateway_callback path /_gateway/start /_gateway/callback
+    handle @gateway_callback {
+        reverse_proxy 127.0.0.1:19090
+    }
+
+    handle {
+        route {
+            request_header -X-Gateway-Upstream
+            request_header -X-Gateway-Transport
+            request_header -X-Gateway-TLS-Name
+            request_header -X-Gateway-Backend-Host
+            request_header -X-Gateway-Cookie
+            request_header -X-Gateway-Set-Cookie
+            request_header -X-Gateway-Token
+            request_header -X-Gateway-User
+            request_header -X-Gateway-User-Id
+            request_header -X-Gateway-Role
+            request_header -X-Gateway-User-Info
+
+            forward_auth 127.0.0.1:19090 {
+                uri /internal/auth
+                copy_headers X-Gateway-Upstream X-Gateway-Transport X-Gateway-TLS-Name X-Gateway-Backend-Host X-Gateway-Cookie X-Gateway-Set-Cookie X-Gateway-Token X-Gateway-User X-Gateway-User-Id X-Gateway-Role X-Gateway-User-Info
+            }
+
+            @issue_binding header_regexp X-Gateway-Set-Cookie .+
+            header @issue_binding +Set-Cookie {http.request.header.X-Gateway-Set-Cookie}
+
+            @https_backend header X-Gateway-Transport https
+            handle @https_backend {
+                reverse_proxy {http.request.header.X-Gateway-Upstream} {
+                    header_up Host {http.request.header.X-Gateway-Backend-Host}
+                    header_up Cookie {http.request.header.X-Gateway-Cookie}
+                    header_up -X-Gateway-Upstream
+                    header_up -X-Gateway-Transport
+                    header_up -X-Gateway-TLS-Name
+                    header_up -X-Gateway-Backend-Host
+                    header_up -X-Gateway-Cookie
+                    header_up -X-Gateway-Set-Cookie
+                    transport http {
+                        tls
+                        tls_server_name {http.request.header.X-Gateway-TLS-Name}
+                        dial_timeout 5s
+                        response_header_timeout 30s
+                    }
+                    flush_interval -1
+                }
+            }
+            handle {
+                reverse_proxy {http.request.header.X-Gateway-Upstream} {
+                    header_up Host {http.request.header.X-Gateway-Backend-Host}
+                    header_up Cookie {http.request.header.X-Gateway-Cookie}
+                    header_up -X-Gateway-Upstream
+                    header_up -X-Gateway-Transport
+                    header_up -X-Gateway-TLS-Name
+                    header_up -X-Gateway-Backend-Host
+                    header_up -X-Gateway-Cookie
+                    header_up -X-Gateway-Set-Cookie
+                    transport http {
+                        dial_timeout 5s
+                        response_header_timeout 30s
+                    }
+                    flush_interval -1
+                }
+            }
+        }
+    }
+}
+
+uejd.perfy576.com {
+    import gateway_application
+}
+
+https:// {
+    tls {
+        on_demand
+    }
+    import gateway_application
+}

@@ -1,0 +1,41 @@
+{
+    on_demand_tls {
+        ask http://127.0.0.1:19090/internal/tls-ask
+    }
+}
+
+import /etc/caddy/gateway.caddy
+
+note.perfy576.com {
+	request_body {
+		max_size 100MB
+	}
+
+	handle /sync/* {
+		reverse_proxy 127.0.0.1:30002 {
+			transport http {
+				read_timeout 3600s
+				write_timeout 3600s
+			}
+		}
+	}
+
+	handle {
+		reverse_proxy 127.0.0.1:10100 {
+			transport http {
+				read_timeout 3600s
+				write_timeout 3600s
+			}
+		}
+	}
+}
+
+agent.perfy576.com {
+	encode zstd gzip
+
+	request_body {
+		max_size 100MB
+	}
+
+	reverse_proxy 127.0.0.1:18800
+}
