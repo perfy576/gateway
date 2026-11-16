@@ -1,0 +1,1 @@
+ALTER TABLE services ADD COLUMN cookie_max_age_seconds BIGINT UNSIGNED NOT NULL DEFAULT 43200;

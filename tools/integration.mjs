@@ -96,7 +96,8 @@ try {
   const metadata=await request('/api/public?request='+encodeURIComponent(loginRequest));assert.equal(metadata.status,200);assert.equal(metadata.json.service.host,hostname);assert.equal(metadata.json.services,undefined);
   const tokenParts=loginRequest.split('.');const altered={...requestClaims,return_url:'https://attacker.invalid/'};tokenParts[1]=Buffer.from(JSON.stringify(altered)).toString('base64url');
   r=await request('/api/public?request='+encodeURIComponent(tokenParts.join('.')));assert.equal(r.status,410);check('signed login URL binds service, return address and expiry; tampering rejected');
-  r=await request(flowLogin);assert.equal(r.status,302);const callback=r.headers.location;
+  r=await request(flowLogin);assert.equal(r.status,200);check('console login does not authorize business login');
+  r=await request('/api/login',{method:'POST',body:{username:adminUsername,password,mode:'service',appid:'gateway-e2e',token:loginRequest}});assert.equal(r.status,200);const callback=r.json.redirect;
   const absentBinder=await request(callback,{jar:false});assert.equal(absentBinder.status,403);check('SSO callback requires original browser cookie');
   r=await request(callback);assert.equal(r.status,302,r.text);assert.equal(r.headers.location,'/private/path?x=1&y=two');
   const replay=await request(callback);assert.equal(replay.status,410);check('one-time cross-domain SSO and exact return URL');
@@ -131,12 +132,12 @@ try {
   check('ordinary users cannot log in to admin or access ungranted services');
   restricted.users=[otherUser];await admin(`/api/admin/services/${id}`,'PUT',restricted);
   r=await request('/api/login',{method:'POST',body:{username,password:userPassword,mode:'service',request:memberRequest}});assert.equal(r.status,200);
-  r=await request(r.json.redirect);assert.equal(r.status,302);r=await request(r.headers.location);assert.equal(r.status,302);
+  r=await request(r.json.redirect);assert.equal(r.status,302);
   r=await request(`https://${hostname}/member-only`);assert.equal(r.status,200);assert.equal(verify(r.json.headers['x-gateway-token'],hostname,'GET','/member-only').sub,otherUser);
-  r=await request('/api/admin/state');assert.equal(r.status,403);check('explicit user grant permits service access while keeping admin APIs restricted');
+  r=await request('/api/admin/state');assert.equal(r.status,200);check('explicit business user grant preserves the independent console login');
   csrf=(await admin('/api/me')).csrf;const changedPassword=randomBytes(16).toString('hex');
-  await admin('/api/password','POST',{old_password:userPassword,new_password:changedPassword});
-  r=await request('/api/me');assert.equal(r.status,401);r=await request(`https://${hostname}/member-only`);assert.equal(r.status,302);
+  await admin(`/api/admin/users/${otherUser}`,'PUT',{username,display_name:'权限测试用户',password:changedPassword,role:'user',enabled:true});
+  r=await request('/api/me');assert.equal(r.status,200);r=await request(`https://${hostname}/member-only`);assert.equal(r.status,302);
   r=await request('/api/login',{method:'POST',body:{username,password:userPassword,mode:'service',request:memberRequest}});assert.equal(r.status,401);
   check('password change invalidates every user session and rejects the old password');
   r=await request('/api/login',{method:'POST',body:{username:adminUsername,password,mode:'admin'}});assert.equal(r.status,200);csrf=(await admin('/api/me')).csrf;

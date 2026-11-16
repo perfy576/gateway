@@ -1,7 +1,9 @@
 #include "security.h"
 #include "gateway_identity.h"
+#include "session_policy.h"
 #include <functional>
 #include <iostream>
+#include <limits>
 
 static void require(bool value,const char *message) { if (!value) throw std::runtime_error(message); }
 static void rejects(const std::function<void()>& action) {
@@ -9,6 +11,19 @@ static void rejects(const std::function<void()>& action) {
     require(rejected,"Expected rejection");
 }
 int main() {
+    require(cookie_seconds_from_hours(0)==0,"Unlimited cookie lifetime");
+    require(cookie_seconds_from_hours(0.5)==1800,"Fractional cookie hours");
+    require(cookie_seconds_from_hours(1.25)==4500,"Cookie hour precision");
+    require(cookie_seconds_from_hours(0.000001)==1,"Positive cookie lifetime must not become unlimited");
+    rejects([]{cookie_seconds_from_hours(-1);});
+    rejects([]{cookie_seconds_from_hours(std::numeric_limits<double>::infinity());});
+    rejects([]{cookie_seconds_from_hours(std::numeric_limits<double>::quiet_NaN());});
+    rejects([]{cookie_seconds_from_hours(MAX_COOKIE_HOURS+1);});
+    require(session_expires_at(100,0)==0 && session_is_alive(0,9999999999LL),"Unlimited session expiry");
+    require(session_is_alive(120,119) && !session_is_alive(120,120) && !session_is_alive(-1,120),"Exact session expiry");
+    require(browser_cookie_age(0)==BROWSER_COOKIE_LIMIT_SECONDS && browser_cookie_age(1800)==1800,"Browser cookie limit");
+    require(session_is_online(100,159) && !session_is_online(100,160),"Online session one-minute boundary");
+    require(session_is_alive(1000,160) && !session_is_online(100,160),"Valid sessions can be offline");
     auto secret=random_hex(); auto t=std::time(nullptr);
     auto binding="v1."+random_hex(),cookies=std::string(BINDING_COOKIE)+"="+binding;
     GatewayVerifier verifier(secret,"https://gateway.example.com","app.example.com");

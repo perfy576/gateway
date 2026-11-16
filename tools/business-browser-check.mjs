@@ -33,7 +33,7 @@ relay.on('connection',socket=>{sockets.add(socket);socket.on('close',()=>sockets
 await new Promise(resolve=>relay.listen(19444,'127.0.0.1',resolve));
 const browser=await chromium.launch({headless:true,executablePath:process.env.CHROMIUM_PATH,args:['--no-sandbox',`--host-resolver-rules=MAP ${host} 127.0.0.1:19444`]});
 let id,csrf;
-const admin=await browser.newContext();
+const admin=await browser.newContext({locale:'zh-CN',ignoreHTTPSErrors:true});
 async function api(path,method='GET',body) {
   const response=await admin.request.fetch(origin+path,{method,headers:{'X-Gateway-Request':'1','X-CSRF-Token':csrf || '',Origin:origin,'Content-Type':'application/json'},data:body});
   const result=await response.json();assert.equal(response.status(),200,JSON.stringify(result));return result;
@@ -48,9 +48,12 @@ try {
     input:JSON.stringify({operation:'checkCookie',gateway_host:origin,audience:host,appid:'gateway-login-browser',token:'',cookie:'',method:'GET',uri:'/docs/project?version=2&lang=zh'})});
   assert.equal(generated.status,0,generated.stderr);const bootstrap=JSON.parse(generated.stdout);
   assert.equal(bootstrap.result,'redictionToLogin');assert.equal(bootstrap.status,302);
-  const context=await browser.newContext({viewport:{width:1440,height:1000},locale:'zh-CN',ignoreHTTPSErrors:true});
+  const context=admin;
+  context.setDefaultTimeout(30000);
   const page=await context.newPage(),errors=[];page.on('pageerror',error=>errors.push(error.message));
+  await page.setViewportSize({width:1440,height:1000});
   await page.goto(bootstrap.redictUrl);await page.getByRole('heading',{name:'项目文档中心',exact:true}).waitFor();
+  assert.equal(new URL(page.url()).hostname,'gateway.perfy576.com');
   assert.equal(await page.locator('select,[role="combobox"]').count(),0);assert.equal(await page.locator('input').count(),2);
   assert.equal(await page.locator('.login-target .mono').textContent(),host);assert.equal(await page.locator('.return-address').textContent(),'/docs/project?version=2&lang=zh');
   await page.screenshot({path:'artifacts/business-login-desktop.png',fullPage:true});
@@ -64,6 +67,7 @@ try {
   assert(!response.headers.cookie?.includes('__Host-gateway_session'));assert(response.headers.cookie?.includes('__Host-gateway_binding=v1.'));
   assert((await context.cookies('https://'+host)).some(c=>c.name==='__Host-gateway_session' && c.secure && c.httpOnly && c.sameSite==='Lax'));
   await page.reload();assert.equal(new URL(page.url()).host,host);assert.deepEqual(errors,[]);
+  assert.equal((await api('/api/me')).user.username,adminUsername);
   console.log('PASS browser SDK login bootstrap establishes browser binding and preserves negotiated version; immutable target, cross-domain callback, exact URL restoration and repeat access verified; desktop/mobile screenshots captured');
 } finally {
   if(id)await api('/api/admin/services/'+id,'DELETE',{}).catch(error=>console.error('CLEANUP',error.message));

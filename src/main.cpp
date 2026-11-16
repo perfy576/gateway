@@ -1,6 +1,7 @@
 #include "db.h"
 #include "security.h"
 #include "protocol.h"
+#include "session_policy.h"
 #include <workflow/WFHttpServer.h>
 #include <workflow/WFTaskFactory.h>
 #include <workflow/HttpUtil.h>
@@ -40,10 +41,13 @@ struct Service {
     Upstream target;
     bool enabled, allow_all;
     std::vector<std::string> excluded, users;
+    long long cookie_lifetime = DEFAULT_SERVICE_COOKIE_SECONDS;
+    bool builtin = false;
 };
 static json service_json(const Service& s) {
     return {{"id",s.id},{"appid",s.appid},{"name",s.name},{"host",s.host},{"upstream",s.upstream},
-        {"enabled",s.enabled},{"allow_all",s.allow_all},{"excluded_paths",s.excluded},{"users",s.users}};
+        {"enabled",s.enabled},{"allow_all",s.allow_all},{"excluded_paths",s.excluded},{"users",s.users},
+        {"cookie_max_age_hours",s.cookie_lifetime / 3600.0},{"builtin",s.builtin}};
 }
 struct Config {
     std::unordered_map<std::string,User> users;
@@ -66,7 +70,13 @@ struct ClientProtocol {
     int token_version=TOKEN_VERSION,cookie_version=COOKIE_VERSION;
     bool online_only=false;
 };
-struct Session { std::string user_id, ip, host, binding_hash; long long expires, created; ClientProtocol protocol; std::string service_id; };
+struct Session {
+    std::string user_id, ip, host, binding_hash;
+    long long expires, created;
+    ClientProtocol protocol;
+    std::string service_id;
+    long long cookie_lifetime, cookie_refreshed, last_seen;
+};
 static std::unordered_map<std::string,Session> sessions;
 static std::shared_mutex session_mutex;
 struct Flow {
@@ -88,15 +98,25 @@ static void load_config() {
         User u{r[0],r[1],r[2],r[3],r[4],r[5]=="1"};
         next->usernames[u.username] = u.id; next->users[u.id] = u;
     }
-    for (const auto& r : db().query("SELECT id,name,host,upstream,token_secret,enabled,allow_all,excluded_paths,appid FROM services")) {
+    for (const auto& r : db().query("SELECT id,name,host,upstream,token_secret,enabled,allow_all,excluded_paths,appid,cookie_max_age_seconds FROM services")) {
         Service s{r[0],r[1],r[2],r[3],r[4],r[8],parse_upstream(r[3]),r[5]=="1",r[6]=="1",json::parse(r[7]).get<std::vector<std::string>>(),{}};
+        s.cookie_lifetime=std::stoll(r[9]);
+        s.builtin=s.host==public_host;
         next->hosts[s.host] = s.id; next->appids[s.appid]=s.id; next->services[s.id] = std::move(s);
     }
     for (const auto& r : db().query("SELECT service_id,user_id FROM service_users")) {
         auto found = next->services.find(r[0]);
         if (found != next->services.end()) found->second.users.push_back(r[1]);
     }
+    auto console=next->hosts.find(public_host);
+    if(console==next->hosts.end())throw std::runtime_error("Built-in console service is missing");
+    auto& console_users=next->services.at(console->second).users;
+    for(const auto& [id,user]:next->users)
+        if(user.role=="admin" && std::find(console_users.begin(),console_users.end(),id)==console_users.end())console_users.push_back(id);
     std::atomic_store(&config, std::shared_ptr<const Config>(next));
+}
+static const Service& console_service(const Config& c) {
+    return c.services.at(c.hosts.at(public_host));
 }
 static std::string header(WFHttpTask *task, const std::string& name) {
     protocol::HttpHeaderCursor cursor(task->get_req()); std::string value;
@@ -123,7 +143,8 @@ static std::string clean_cookies(WFHttpTask *task, const std::string& binding) {
     return output+BINDING_COOKIE+"="+binding;
 }
 static std::string cookie_header_value(const std::string& name,const std::string& value,long long lifetime) {
-    return name+"="+value+"; Path=/; Secure; HttpOnly; SameSite=Lax; Max-Age="+std::to_string(lifetime);
+    auto age=value.empty()?0:browser_cookie_age(lifetime);
+    return name+"="+value+"; Path=/; Secure; HttpOnly; SameSite=Lax; Max-Age="+std::to_string(age);
 }
 static void set_cookie(WFHttpTask *task, const std::string& name, const std::string& value, long long lifetime) {
     task->get_resp()->add_header_pair("Set-Cookie",cookie_header_value(name,value,lifetime));
@@ -158,31 +179,76 @@ static const Service& service_by_host(const Config& c, const std::string& host) 
     auto it=c.hosts.find(host);
     if (it==c.hosts.end()) throw HttpError(404,"该域名未接入网关");
     const auto& s=c.services.at(it->second);
+    if(s.builtin)throw HttpError(400,"内置控制台不提供业务反向代理");
     if (!s.enabled) throw HttpError(403,"该服务已停用");
     return s;
 }
 static const Service& service_by_appid(const Config& c,const std::string& appid) {
     auto found=c.appids.find(appid);
-    if(found==c.appids.end()||!c.services.at(found->second).enabled)throw HttpError(400,"AppID 无效或服务已停用");
+    if(found==c.appids.end()||!c.services.at(found->second).enabled||c.services.at(found->second).builtin)throw HttpError(400,"AppID 无效或服务已停用");
     return c.services.at(found->second);
 }
+static void disabled_service_headers(WFHttpTask *task,const Service& service) {
+    task->get_resp()->set_header_pair("X-Gateway-Redirect-Reason","service_disabled");
+    task->get_resp()->set_header_pair("X-Gateway-Service-Appid",service.appid);
+}
+static bool redirect_disabled_service(WFHttpTask *task,const Config& c,const std::string& host,const std::string& method,bool nginx=false) {
+    auto found=c.hosts.find(host);
+    if(found==c.hosts.end())return false;
+    const auto& service=c.services.at(found->second);
+    if(service.builtin||service.enabled)return false;
+    const auto target=origin+"/?reason=service_disabled&appid="+encode_url(service.appid);
+    disabled_service_headers(task,service);
+    task->get_resp()->set_header_pair("X-Gateway-Redirect",target);
+    if(!nginx&&(method=="GET"||method=="HEAD"))redirect(task,target);
+    else respond(task,403,{{"error","该服务已停用"},{"reason","service_disabled"},{"redirect_url",target}});
+    return true;
+}
 static bool permitted(const Service& s, const User& u) {
-    return u.enabled && (u.role=="admin" || s.allow_all || std::find(s.users.begin(),s.users.end(),u.id)!=s.users.end());
+    return u.enabled && ((s.builtin && u.role=="admin") || s.allow_all || std::find(s.users.begin(),s.users.end(),u.id)!=s.users.end());
 }
 static std::string session_key(WFHttpTask *task) {
     auto token=cookie(task,"__Host-gateway_session");
     return valid_cookie_v1(token) ? sha256(token) : "";
 }
+static long long session_expiry(const Session& session, const Config& c) {
+    if (session.service_id.empty()) return session.host==public_host ? session.expires : -1;
+    auto service=c.services.find(session.service_id);
+    if(service==c.services.end() || !service->second.enabled || service->second.host!=session.host) return -1;
+    return session_expires_at(session.created,service->second.cookie_lifetime);
+}
 static User current_user(WFHttpTask *task, const Config& c, bool required=true) {
-    std::string id, key=session_key(task),binding=cookie(task,BINDING_COOKIE);
+    std::string id, service_id, key=session_key(task),binding=cookie(task,BINDING_COOKIE);
+    auto t=now();bool touch=false;
     {
         std::shared_lock lock(session_mutex); auto it=sessions.find(key);
-        if (it!=sessions.end() && it->second.expires>now() && it->second.host==header(task,"Host") &&
+        if (it!=sessions.end() && session_is_alive(session_expiry(it->second,c),now()) && it->second.host==header(task,"Host") &&
             valid_cookie_v1(binding) && secure_equal(it->second.binding_hash,sha256(binding)) &&
-            (it->second.service_id.empty() || (c.hosts.count(it->second.host) && c.hosts.at(it->second.host)==it->second.service_id))) id=it->second.user_id;
+            (it->second.service_id.empty() || (c.hosts.count(it->second.host) && c.hosts.at(it->second.host)==it->second.service_id))) {
+            id=it->second.user_id;service_id=it->second.service_id;touch=it->second.last_seen<t;
+        }
     }
     auto found=c.users.find(id);
-    if (found!=c.users.end() && found->second.enabled) return found->second;
+    auto service=c.services.find(service_id);
+    if (found!=c.users.end() && service!=c.services.end() && permitted(service->second,found->second)) {
+        bool refresh=false;long long remaining=0;
+        if(service->second.builtin){
+            std::shared_lock lock(session_mutex);auto it=sessions.find(key);
+            if(it!=sessions.end()){
+                refresh=it->second.cookie_lifetime!=service->second.cookie_lifetime||t-it->second.cookie_refreshed>=86400;
+                auto expiry=session_expiry(it->second,c);remaining=expiry==0?0:std::max(1LL,expiry-t);
+            }
+        }
+        if(touch||refresh){
+            std::unique_lock lock(session_mutex);auto it=sessions.find(key);
+            if(it!=sessions.end()){
+                it->second.last_seen=std::max(t,it->second.last_seen);
+                if(refresh){it->second.cookie_refreshed=t;it->second.cookie_lifetime=service->second.cookie_lifetime;}
+            }
+        }
+        if(refresh){set_cookie(task,"__Host-gateway_session",cookie(task,"__Host-gateway_session"),remaining);set_cookie(task,BINDING_COOKIE,binding,remaining);}
+        return found->second;
+    }
     if (required) throw HttpError(401,"请先登录");
     return {"","","","","",false};
 }
@@ -198,27 +264,32 @@ static void revoke_user(const std::string& id) {
         if (it->second.user_id==id) it=flows.erase(it); else ++it;
     }
 }
-static std::pair<std::string,std::string> issue_session(WFHttpTask *task,const User& user,const std::string& host,
+struct IssuedSession { std::string token, binding; long long lifetime; };
+static IssuedSession issue_session(WFHttpTask *task,const User& user,const std::string& host,
     const ClientProtocol& protocol,const std::string& service_id,bool replace_browser_session) {
     std::string token="v1."+random_hex(),binding="v1."+random_hex();
     std::unique_lock lock(session_mutex);
     auto live=snapshot();auto current=live->users.find(user.id);
     if (current==live->users.end() || !current->second.enabled || current->second.hash!=user.hash)
         throw HttpError(401,"账号状态已变更，请重新登录");
-    if(!service_id.empty()){
-        auto service=live->services.find(service_id);
+    long long lifetime=session_lifetime;
+    const auto scope=service_id.empty()?console_service(*live).id:service_id;
+    {
+        auto service=live->services.find(scope);
         if(service==live->services.end()||!service->second.enabled||service->second.host!=host||!permitted(service->second,current->second))
             throw HttpError(403,"服务已停用或无访问权限");
+        lifetime=service->second.cookie_lifetime;
     }
     if (sessions.size()>=100000) throw HttpError(503,"会话数量已达上限");
     if(replace_browser_session){auto old=session_key(task);if(!old.empty())sessions.erase(old);}
-    sessions[sha256(token)]={user.id,ip(task),host,sha256(binding),now()+session_lifetime,now(),protocol,service_id};
-    return {token,binding};
+    auto t=now();
+    sessions[sha256(token)]={user.id,ip(task),host,sha256(binding),session_expires_at(t,lifetime),t,protocol,scope,lifetime,t,t};
+    return {token,binding,lifetime};
 }
 static void new_session(WFHttpTask *task, const User& user,const ClientProtocol& protocol={},const std::string& service_id={}) {
-    auto [token,binding]=issue_session(task,user,header(task,"Host"),protocol,service_id,true);
-    set_cookie(task,"__Host-gateway_session",token,session_lifetime);
-    set_cookie(task,BINDING_COOKIE,binding,session_lifetime);
+    auto [token,binding,lifetime]=issue_session(task,user,header(task,"Host"),protocol,service_id,true);
+    set_cookie(task,"__Host-gateway_session",token,lifetime);
+    set_cookie(task,BINDING_COOKIE,binding,lifetime);
 }
 static void csrf(WFHttpTask *task, bool authenticated) {
     if (header(task,"Origin")!=origin) throw HttpError(403,"请求来源校验失败");
@@ -374,7 +445,8 @@ static void app_login(WFHttpTask *task,const Config& c,const std::string& query_
         used_login_tokens[key]=login.expires;
         if(!login.flow_id.empty())flows.erase(login.flow_id);
     }
-    auto [session,binding]=issue_session(task,current->second,service.host,login.login.protocol,service.id,false);
+    auto [session,binding,lifetime]=issue_session(task,current->second,service.host,login.login.protocol,service.id,false);
+    (void)lifetime;
     respond(task,200,{{"result","Ok"},{"retmsg","登录成功"},
         {"cookie","__Host-gateway_session="+session+"; "+BINDING_COOKIE+"="+binding}});
 }
@@ -382,9 +454,27 @@ static void authenticate(WFHttpTask *task, bool nginx) {
     ++auth_requests;
     auto c=snapshot();
     auto host=header(task,"X-Forwarded-Host"), uri=header(task,"X-Forwarded-Uri");
+    if(redirect_disabled_service(task,*c,host,header(task,"X-Forwarded-Method"),nginx)){++auth_rejected;return;}
     auto& s=service_by_host(*c,host);
     if (!valid_path(uri)) throw HttpError(400,"请求地址无效");
     auto user=current_user(task,*c,false);
+    long long expires=0;
+    ClientProtocol protocol;
+    bool refresh_session=false;
+    if(!user.id.empty()){
+        std::shared_lock lock(session_mutex);auto found=sessions.find(session_key(task));
+        if(found==sessions.end() || found->second.service_id!=s.id || !session_is_alive(session_expiry(found->second,*c),now()))
+            user={"","","","","",false};
+        else {
+            auto& session=found->second;
+            protocol=session.protocol;expires=session_expiry(session,*c);
+            refresh_session=session.cookie_lifetime!=s.cookie_lifetime || now()-session.cookie_refreshed>=86400;
+        }
+    }
+    if(refresh_session){
+        std::unique_lock lock(session_mutex);auto found=sessions.find(session_key(task));
+        if(found!=sessions.end()){found->second.cookie_lifetime=s.cookie_lifetime;found->second.cookie_refreshed=now();}
+    }
     if (user.id.empty() && !excluded_path(s,uri)) {
         ++auth_rejected;
         std::string login=make_login_request(task,s,uri);
@@ -398,12 +488,8 @@ static void authenticate(WFHttpTask *task, bool nginx) {
     auto binding=cookie(task,BINDING_COOKIE);bool issue_binding=!valid_cookie_v1(binding);
     if(issue_binding)binding="v1."+random_hex();
     auto t=now();
-    ClientProtocol protocol;
-    if(!user.id.empty()){
-        std::shared_lock lock(session_mutex);auto found=sessions.find(session_key(task));
-        if(found!=sessions.end())protocol=found->second.protocol;
-    }
-    json claims={{"iss",origin},{"aud",s.host},{"sub",user.id},{"iat",t},{"nbf",t-2},{"exp",t+60},
+    auto token_expires=expires==0?t+60:std::min(t+60,expires);
+    json claims={{"iss",origin},{"aud",s.host},{"sub",user.id},{"iat",t},{"nbf",t-2},{"exp",token_expires},
         {"authenticated",!user.id.empty()},{"username",user.username},{"display_name",user.name},{"role",user.role},
         {"request_method",header(task,"X-Forwarded-Method")},{"request_uri_sha256",sha256(uri)},
         {"ver",TOKEN_VERSION},{"type","gateway_access"},{"cookie_version",COOKIE_VERSION},{"cookie_name",BINDING_COOKIE},
@@ -416,7 +502,9 @@ static void authenticate(WFHttpTask *task, bool nginx) {
     resp->set_header_pair("X-Gateway-TLS-Name",s.target.hostname);
     resp->set_header_pair("X-Gateway-Backend-Host",s.target.address);
     resp->set_header_pair("X-Gateway-Cookie",clean_cookies(task,binding));
-    resp->set_header_pair("X-Gateway-Set-Cookie",issue_binding?cookie_header_value(BINDING_COOKIE,binding,session_lifetime):"");
+    auto remaining=expires==0?0:std::max(1LL,expires-t);
+    resp->set_header_pair("X-Gateway-Set-Cookie",issue_binding||refresh_session?cookie_header_value(BINDING_COOKIE,binding,user.id.empty()?s.cookie_lifetime:remaining):"");
+    resp->set_header_pair("X-Gateway-Set-Session-Cookie",refresh_session?cookie_header_value("__Host-gateway_session",cookie(task,"__Host-gateway_session"),remaining):"");
     resp->set_header_pair("X-Gateway-Token",sign_jwt(claims,s.secret));
     resp->set_header_pair("X-Gateway-User",user.username);
     resp->set_header_pair("X-Gateway-User-Id",user.id);
@@ -442,14 +530,16 @@ static void verify_backend_request(WFHttpTask *task,const Config& c) {
         if(claims["authenticated"].get<bool>()) {
             std::string uid;
             {std::shared_lock lock(session_mutex);auto it=sessions.find(claims["sid"].get<std::string>());
-             if(it==sessions.end() || it->second.expires<=now() || it->second.host!=audience ||
-                (!it->second.service_id.empty()&&it->second.service_id!=service.id) ||
+             if(it==sessions.end() || !session_is_alive(session_expiry(it->second,c),now()) || it->second.host!=audience ||
+                it->second.service_id!=service.id ||
                 !secure_equal(it->second.binding_hash,claims["cookie_sha256"]))throw std::invalid_argument("Session revoked");
              uid=it->second.user_id;}
             auto user=c.users.find(uid);
             if(user==c.users.end() || claims["sub"]!=uid || !permitted(service,user->second) ||
                 claims["username"]!=user->second.username || claims["role"]!=user->second.role)
                 throw std::invalid_argument("User access revoked");
+            {std::unique_lock lock(session_mutex);auto session=sessions.find(claims["sid"].get<std::string>());
+             if(session!=sessions.end())session->second.last_seen=std::max(session->second.last_seen,now());}
         } else if(!excluded_path(service,uri))throw std::invalid_argument("Anonymous access no longer permitted");
         respond(task,200,{{"valid",true},{"version",TOKEN_VERSION},{"verified_at",now()},{"claims",claims},
             {"token_sha256",sha256(token)},{"cookie_header_sha256",sha256(cookies)},
@@ -457,7 +547,7 @@ static void verify_backend_request(WFHttpTask *task,const Config& c) {
     } catch(const HttpError&) {throw;}
       catch(const std::exception&) {respond(task,401,{{"valid",false},{"error","Invalid token, cookie, request or session"}});}
 }
-static void authorize(WFHttpTask *task, const Config& c, const User& user, const std::string& request) {
+static std::string authorization_url(const Config& c, const User& user, const std::string& request) {
     auto [id,flow]=checked_flow(request);
     std::string ticket=random_hex(), host;
     {
@@ -469,7 +559,7 @@ static void authorize(WFHttpTask *task, const Config& c, const User& user, const
         it->second.ticket_hash=sha256(ticket); it->second.user_id=user.id; it->second.ticket_expires=now()+30;
         host=service->second.host;
     }
-    redirect(task,"https://"+host+"/_gateway/callback?flow="+id+"&ticket="+ticket);
+    return "https://"+host+"/_gateway/callback?flow="+id+"&ticket="+ticket;
 }
 static void callback(WFHttpTask *task, const Config& c, const std::string& id, const std::string& ticket) {
     if (id.size()!=64 || ticket.size()!=64) throw HttpError(400,"登录凭据无效");
@@ -494,27 +584,41 @@ static void callback(WFHttpTask *task, const Config& c, const std::string& id, c
 static json session_list(const Config& c) {
     json result=json::array(); std::shared_lock lock(session_mutex);
     for (const auto& [key,s]:sessions) {
-        if (s.expires<=now()) continue;
+        auto expires=session_expiry(s,c);
+        if (!session_is_alive(expires,now())) continue;
         auto u=c.users.find(s.user_id); if (u==c.users.end()) continue;
+        const Service *service=s.service_id.empty()?nullptr:&c.services.at(s.service_id);
+        if(!u->second.enabled || (service && !permitted(*service,u->second))) continue;
         result.push_back({{"id",key},{"user_id",s.user_id},{"username",u->second.username},
-            {"ip",s.ip},{"created_at",s.created},{"expires_at",s.expires}});
+            {"ip",s.ip},{"created_at",s.created},{"expires_at",expires},{"host",s.host},
+            {"service_id",s.service_id},{"appid",service?service->appid:""},{"service_name",service?service->name:"Gateway 控制台"},
+            {"scope",service&&service->builtin?"admin":"service"},{"last_seen_at",s.last_seen},
+            {"online",session_is_online(s.last_seen,now())}});
     }
     return result;
 }
 static void validate_service(const json& b, const Config& c, const std::string& id) {
+    auto current=c.services.find(id);
+    const bool builtin=current!=c.services.end()&&current->second.builtin;
+    if(b.contains("cookie_max_age_hours")){
+        if(!b["cookie_max_age_hours"].is_number())throw HttpError(400,"Cookie 有效期必须是小时数");
+        try{cookie_seconds_from_hours(b["cookie_max_age_hours"].get<double>());}
+        catch(const std::exception&){throw HttpError(400,"Cookie 有效期必须为 0 至 876000 小时，0 表示无限");}
+    }
     auto appid=text_field(b,"appid",1,64);
+    if(appid=="gateway-console"&&!builtin)throw HttpError(400,"该 AppID 保留给内置控制台");
     static const std::regex appid_pattern(R"(^[a-zA-Z0-9][a-zA-Z0-9_.-]{0,63}$)");
     if(!std::regex_match(appid,appid_pattern))throw HttpError(400,"AppID 仅支持字母、数字、下划线、点和连字符");
     auto existing=c.appids.find(appid);
     if(existing!=c.appids.end()&&existing->second!=id)throw HttpError(409,"AppID 已被使用");
     text_field(b,"name",1,128); auto host=text_field(b,"host",1,253);
-    if (!valid_host(host) || host==public_host) throw HttpError(400,"请输入有效的业务域名，不能使用网关自身域名");
+    if (!valid_host(host) || (host==public_host&&!builtin)) throw HttpError(400,"请输入有效的业务域名，不能使用网关自身域名");
     std::string reserved=","+env("GATEWAY_RESERVED_HOSTS")+",";
     if (reserved.find(","+host+",")!=std::string::npos) throw HttpError(400,"该域名已有独立 Caddy 站点，请先迁移原站点配置");
     auto it=c.hosts.find(host);
     if (it!=c.hosts.end() && it->second!=id) throw HttpError(409,"该域名已经配置");
     auto target=parse_upstream(text_field(b,"upstream",1,512));
-    if (target.hostname==public_host || target.address=="127.0.0.1:19090" || target.address=="localhost:19090")
+    if (!builtin&&(target.hostname==public_host || target.address=="127.0.0.1:19090" || target.address=="localhost:19090"))
         throw HttpError(400,"后端地址不能指向网关自身");
     if (!b.contains("excluded_paths") || !b["excluded_paths"].is_array() || b["excluded_paths"].size()>100)
         throw HttpError(400,"免登录路径最多 100 条");
@@ -530,29 +634,51 @@ static void validate_service(const json& b, const Config& c, const std::string& 
     for (const auto& u:b["users"]) if (!u.is_string() || !c.users.count(u.get<std::string>())) throw HttpError(400,"用户不存在");
     if (!b.contains("enabled") || !b["enabled"].is_boolean() || !b.contains("allow_all") || !b["allow_all"].is_boolean())
         throw HttpError(400,"服务开关格式无效");
+    if(builtin){
+        const auto& fixed=current->second;
+        if(appid!=fixed.appid||host!=fixed.host||b["name"]!=fixed.name||b["upstream"]!=fixed.upstream||!b["enabled"].get<bool>()||!b["excluded_paths"].empty())
+            throw HttpError(400,"内置控制台的标识、路由及启用状态不能修改");
+        for(const auto& [uid,user]:c.users)
+            if(user.role=="admin"&&std::find(b["users"].begin(),b["users"].end(),json(uid))==b["users"].end())
+                throw HttpError(400,"管理员的控制台登录权限不能移除");
+    }
 }
 static void mutate_service(WFHttpTask *task, const json& b, const std::string& id, const User& actor) {
     auto c=snapshot(); validate_service(b,*c,id);
+    if(!id.empty()&&!c->services.count(id))throw HttpError(404,"服务不存在");
+    auto lifetime=b.contains("cookie_max_age_hours")?cookie_seconds_from_hours(b["cookie_max_age_hours"].get<double>()):
+        (id.empty()?DEFAULT_SERVICE_COOKIE_SECONDS:c->services.at(id).cookie_lifetime);
     auto& d=db(); d.begin(); std::string saved=id;
     try {
         std::vector<std::string> values={b["name"],b["host"],b["upstream"],b["excluded_paths"].dump(),
             b["enabled"].get<bool>()?"1":"0",b["allow_all"].get<bool>()?"1":"0"};
         values.push_back(b["appid"]);
+        values.push_back(std::to_string(lifetime));
         if (id.empty()) {
             values.push_back(random_hex());
-            d.query("INSERT INTO services(name,host,upstream,excluded_paths,enabled,allow_all,appid,token_secret) VALUES(?,?,?,?,?,?,?,?)",values);
+            d.query("INSERT INTO services(name,host,upstream,excluded_paths,enabled,allow_all,appid,cookie_max_age_seconds,token_secret) VALUES(?,?,?,?,?,?,?,?,?)",values);
             saved=std::to_string(d.inserted());
         } else {
             if (!c->services.count(id)) throw HttpError(404,"服务不存在");
             values.push_back(id);
-            d.query("UPDATE services SET name=?,host=?,upstream=?,excluded_paths=?,enabled=?,allow_all=?,appid=? WHERE id=?",values);
+            d.query("UPDATE services SET name=?,host=?,upstream=?,excluded_paths=?,enabled=?,allow_all=?,appid=?,cookie_max_age_seconds=? WHERE id=?",values);
             d.query("DELETE FROM service_users WHERE service_id=?",{id});
         }
         for (const auto& u:b["users"]) d.query("INSERT IGNORE INTO service_users(service_id,user_id) VALUES(?,?)",{saved,u.get<std::string>()});
         audit(task,actor.username,id.empty()?"service.create":"service.update",b["host"]);
         d.commit();
     } catch (...) { try { d.rollback(); } catch (...) {} throw; }
-    load_config(); respond(task,200,{{"id",saved},{"appid",snapshot()->services.at(saved).appid},{"ok",true}});
+    load_config();auto live=snapshot();const auto& service=live->services.at(saved);
+    {
+        std::unique_lock lock(session_mutex);
+        for(auto it=sessions.begin();it!=sessions.end();){
+            auto user=live->users.find(it->second.user_id);
+            if(it->second.service_id==saved && (!service.enabled || user==live->users.end() || !permitted(service,user->second)))
+                it=sessions.erase(it);
+            else ++it;
+        }
+    }
+    respond(task,200,{{"id",saved},{"appid",service.appid},{"ok",true}});
 }
 static void mutate_user(WFHttpTask *task, const json& b, const std::string& id, const User& actor) {
     auto c=snapshot();
@@ -587,13 +713,29 @@ static void dispatch(WFHttpTask *task) {
     if (path=="/healthz" && method=="GET") { respond(task,200,{{"ok",true},{"uptime_seconds",now()-started}}); return; }
     if (path=="/internal/tls-ask" && method=="GET") {
         if (params["domain"]==public_host) task->get_resp()->set_status_code("200");
-        else { service_by_host(*c,params["domain"]); task->get_resp()->set_status_code("200"); }
+        else {
+            if(!c->hosts.count(params["domain"]))throw HttpError(404,"该域名未接入网关");
+            task->get_resp()->set_status_code("200");
+        }
         return;
     }
     if ((path=="/internal/auth" || path=="/internal/nginx-auth") && method=="GET") { authenticate(task,path=="/internal/nginx-auth"); return; }
+    if((path=="/_gateway/start"||path=="/_gateway/callback")&&method=="GET"&&redirect_disabled_service(task,*c,host,method))return;
     if(path=="/_gateway/start"&&method=="GET"){sdk_start(task,*c,login_token,params["appid"],true);return;}
     if (path=="/_gateway/callback" && method=="GET") { callback(task,*c,params["flow"],params["ticket"]); return; }
     if (host!=public_host) throw HttpError(404,"该地址不提供控制台");
+    if((path=="/"||path=="/api/public/notice")&&(method=="GET"||method=="HEAD")){
+        json notice=nullptr;
+        auto found=c->appids.find(params["appid"]);
+        if(params["reason"]=="service_disabled"&&found!=c->appids.end()){
+            const auto& service=c->services.at(found->second);
+            if(!service.enabled&&!service.builtin){
+                disabled_service_headers(task,service);
+                notice={{"reason","service_disabled"},{"appid",service.appid},{"name",service.name},{"host",service.host}};
+            }
+        }
+        if(path=="/api/public/notice"){respond(task,200,{{"notice",notice}});return;}
+    }
     if(path=="/login/start"&&method=="GET"){sdk_start(task,*c,login_token,params["appid"],false);return;}
     if(path=="/login"&&method=="POST"){app_login(task,*c,params["appid"],params["token"]);return;}
     if(path=="/verify" && method=="POST") {verify_backend_request(task,*c);return;}
@@ -605,10 +747,11 @@ static void dispatch(WFHttpTask *task) {
             auto [id,flow]=checked_flow(login_token);
             if(!params["token"].empty()&&params["appid"]!=c->services.at(flow.service_id).appid)throw HttpError(400,"AppID 与登录 Token 不匹配");
         }
-        auto user=current_user(task,*c,false);
-        if (!login_token.empty() && !user.id.empty()) { authorize(task,*c,user,login_token); return; }
     }
-    if (path=="/authorize" && method=="GET") { authorize(task,*c,current_user(task,*c),login_token); return; }
+    if (path=="/authorize" && method=="GET") {
+        auto [id,flow]=checked_flow(login_token);
+        redirect(task,origin+"/login?appid="+c->services.at(flow.service_id).appid+"&token="+encode_url(login_token));return;
+    }
     if (path=="/api/public" && method=="GET") {
         auto [id,flow]=checked_flow(login_token);
         auto s=c->services.find(flow.service_id);
@@ -626,14 +769,19 @@ static void dispatch(WFHttpTask *task) {
         std::string request=b.value("token",b.value("request",std::string())), mode=b.value("mode",std::string());
         std::string target="/admin";
         if (mode=="admin") {
-            if (u->role!="admin") throw HttpError(403,"该账号没有管理后台权限");
+            std::lock_guard lock(control_mutex);auto live=snapshot();auto current=live->users.find(u->id);
+            if(current==live->users.end()||current->second.hash!=u->hash||!permitted(console_service(*live),current->second))
+                throw HttpError(403,"该账号没有控制台登录权限");
+            audit(task,u->username,"login.success","scope=admin");new_session(task,*u);
         } else {
-            auto [id,flow]=checked_flow(request);auto s=c->services.find(flow.service_id);
-            if (s==c->services.end() || !s->second.enabled || !permitted(s->second,*u)) throw HttpError(403,"无权访问目标服务");
+            std::lock_guard lock(control_mutex);auto live=snapshot();auto current=live->users.find(u->id);
+            if(current==live->users.end()||!current->second.enabled||current->second.hash!=u->hash)throw HttpError(401,"账号状态已变更，请重新登录");
+            auto [id,flow]=checked_flow(request);auto s=live->services.find(flow.service_id);
+            if (s==live->services.end() || !s->second.enabled || !permitted(s->second,*u)) throw HttpError(403,"无权访问目标服务");
             if(b.contains("appid")&&b.at("appid")!=s->second.appid)throw HttpError(400,"AppID 与登录 Token 不匹配");
-            target="/authorize?appid="+s->second.appid+"&token="+encode_url(request);
+            audit(task,u->username,"login.success","appid="+s->second.appid);
+            target=authorization_url(*live,current->second,request);
         }
-        audit(task,u->username,"login.success",""); new_session(task,*u);
         respond(task,200,{{"redirect",target}}); return;
     }
     if (path=="/api/me" && method=="GET") {
@@ -663,9 +811,12 @@ static void dispatch(WFHttpTask *task) {
             json services=json::array(), users=json::array();
             for (const auto& [id,s]:c->services) services.push_back(service_json(s));
             for (const auto& [id,user]:c->users) users.push_back(user_json(user));
-            respond(task,200,{{"services",services},{"users",users},{"sessions",session_list(*c)},
+            auto active_sessions=session_list(*c);
+            auto online=std::count_if(active_sessions.begin(),active_sessions.end(),[](const json& s){return s["online"].get<bool>();});
+            respond(task,200,{{"services",services},{"users",users},{"sessions",active_sessions},
                 {"metrics",{{"uptime_seconds",now()-started},{"auth_requests",auth_requests.load()},
-                {"auth_granted",auth_granted.load()},{"auth_rejected",auth_rejected.load()}}}}); return;
+                {"auth_granted",auth_granted.load()},{"auth_rejected",auth_rejected.load()},
+                {"online_sessions",online},{"valid_sessions",active_sessions.size()}}}}); return;
         }
         if (path=="/api/admin/audit" && method=="GET") {
             json entries=json::array();
@@ -676,6 +827,17 @@ static void dispatch(WFHttpTask *task) {
         std::lock_guard lock(control_mutex);
         current_user(task,*snapshot());
         if (snapshot()->users.at(u.id).role!="admin") throw HttpError(403,"需要管理员权限");
+        if(path.rfind("/api/admin/sessions/",0)==0 && method=="DELETE"){
+            auto key=path.substr(std::string("/api/admin/sessions/").size());
+            if(key.size()!=64)throw HttpError(400,"会话标识无效");
+            std::string detail;
+            {std::shared_lock lock(session_mutex);auto found=sessions.find(key);
+             if(found==sessions.end())throw HttpError(404,"会话不存在或已失效");
+             detail=found->second.host;}
+            audit(task,u.username,"session.revoke",detail);
+            {std::unique_lock lock(session_mutex);sessions.erase(key);}
+            respond(task,200,{{"ok",true}});return;
+        }
         static const std::regex service_route(R"(^/api/admin/services(?:/([0-9]+))?(?:/(secret|rotate))?$)"),
             user_route(R"(^/api/admin/users(?:/([0-9]+))?(?:/(revoke))?$)");
         std::smatch match;
@@ -686,6 +848,7 @@ static void dispatch(WFHttpTask *task) {
             }
             auto live=snapshot(); auto s=live->services.find(id);
             if (s==live->services.end()) throw HttpError(404,"服务不存在");
+            if(s->second.builtin)throw HttpError(403,"内置控制台不能删除，也不提供后端签名密钥");
             if (method=="DELETE" && op.empty()) {
                 db().query("DELETE FROM services WHERE id=?",{id}); load_config(); audit(task,u.username,"service.delete",s->second.host);
                 respond(task,200,{{"ok",true}}); return;
@@ -776,6 +939,15 @@ static void bootstrap() {
     db().query("INSERT INTO users(username,display_name,password_hash,role) VALUES('admin','管理员',?,'admin')",{password_hash(pass)});
     std::cout<<"Initial admin credentials written to "<<path<<'\n';
 }
+static void bootstrap_console() {
+    auto existing=db().query("SELECT appid FROM services WHERE host=?",{public_host});
+    if(!existing.empty()){
+        if(existing[0][0]!="gateway-console")throw std::runtime_error("Console service has an unexpected AppID");
+        return;
+    }
+    db().query("INSERT INTO services(appid,name,host,upstream,excluded_paths,token_secret,enabled,allow_all,cookie_max_age_seconds) VALUES(?,?,?,?,?,?,1,0,?)",
+        {"gateway-console","Gateway 控制台",public_host,origin,"[]",random_hex(),std::to_string(session_lifetime)});
+}
 int main() {
     try {
         public_host=env("GATEWAY_HOST","gateway.example.com"); origin="https://"+public_host;
@@ -788,7 +960,7 @@ int main() {
         mysql_library_init(0,nullptr,nullptr);
         if (env("DB_TLS_REQUIRED","true")=="false")
             std::cerr<<"Database TLS enforcement is disabled by configuration\n";
-        bootstrap(); load_config();
+        bootstrap(); bootstrap_console(); load_config();
         for (const auto& [name,type]:std::vector<std::pair<std::string,std::string>>{
             {"index.html","text/html; charset=utf-8"},{"app.css","text/css; charset=utf-8"},
             {"app.js","text/javascript; charset=utf-8"},{"components.js","text/javascript; charset=utf-8"},{"lucide.min.js","text/javascript; charset=utf-8"}}) {
@@ -806,8 +978,8 @@ int main() {
             std::unique_lock lock(cleaner_mutex);
             while (!cleaner_cv.wait_for(lock,std::chrono::seconds(30),[&]{return stop;})) {
                 auto t=now();
-                { std::unique_lock guard(session_mutex);
-                  for (auto it=sessions.begin();it!=sessions.end();) if (it->second.expires<=t) it=sessions.erase(it); else ++it; }
+                { auto c=snapshot();std::unique_lock guard(session_mutex);
+                  for (auto it=sessions.begin();it!=sessions.end();) if (!session_is_alive(session_expiry(it->second,*c),t)) it=sessions.erase(it); else ++it; }
                 { std::lock_guard guard(flow_mutex);
                   for (auto it=flows.begin();it!=flows.end();) if (it->second.expires<=t) it=flows.erase(it); else ++it;
                   for (auto it=used_login_tokens.begin();it!=used_login_tokens.end();) if (it->second<=t) it=used_login_tokens.erase(it); else ++it; }

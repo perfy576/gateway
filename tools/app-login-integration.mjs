@@ -48,7 +48,8 @@ function failed(response,status){assert.equal(response.status,status);assert.dee
 function sign(claims,key=secret){const head=Buffer.from(JSON.stringify({alg:'HS256',typ:'JWT',gwv:1})).toString('base64url'),body=Buffer.from(JSON.stringify(claims)).toString('base64url');return head+'.'+body+'.'+createHmac('sha256',createHmac('sha256',key).update('gateway/sdk-login/v1').digest('hex')).update(head+'.'+body).digest('base64url');}
 try{
   const admin=await request('/api/login',{method:'POST',admin:true,body:{username:adminUsername,password,mode:'admin'}});assert.equal(admin.status,200);
-  adminCookie=admin.headers['set-cookie'].map(c=>c.split(';')[0]).join('; ');csrf=(await api('/api/me')).csrf;
+  adminCookie=admin.headers['set-cookie'].map(c=>c.split(';')[0]).join('; ');const adminMe=await api('/api/me');csrf=adminMe.csrf;
+  service.users=[adminMe.user.id];
   const created=await api('/api/admin/services','POST',service);id=created.id;assert.equal(created.appid,appid);
   otherId=(await api('/api/admin/services','POST',{...service,appid:'Other_App',host:other})).id;
   secret=(await api(`/api/admin/services/${id}/secret`,'POST',{})).secret;assert.match(secret,/^[a-f0-9]{64}$/);
@@ -87,6 +88,14 @@ try{
   failed(await request(queryUrl,{method:'POST',body:{appid:'Other_App',token:queryToken,username:adminUsername,passwd:password}}),400);
   const queryLogin=await request(queryUrl,{method:'POST',body:{username:adminUsername,passwd:password}});
   assert.equal(queryLogin.status,200);assert.equal(queryLogin.json.result,'Ok');assert(queryLogin.json.cookie);
+  service.cookie_max_age_hours=0;await api('/api/admin/services/'+id,'PUT',service);
+  const refreshed=await request(`https://${host}/private`,{headers:{Cookie:queryLogin.json.cookie,'X-Gateway-Set-Session-Cookie':'untrusted'}});
+  assert.equal(refreshed.status,200);
+  assert(refreshed.headers['set-cookie'].some(c=>c.startsWith('__Host-gateway_session=')&&c.includes('Max-Age=34560000')));
+  assert(refreshed.headers['set-cookie'].some(c=>c.startsWith('__Host-gateway_binding=')&&c.includes('Max-Age=34560000')));
+  assert.equal(refreshed.json.headers['x-gateway-set-session-cookie'],undefined);
+  assert.equal(refreshed.json.headers['x-gateway-set-cookie'],undefined);
+  console.log('PASS Caddy refreshes both cookies after lifetime changes and strips spoofed/internal renewal headers');
   console.log('PASS both SDKs generate AppID-bound login tokens; returned cookie permits service access and checkCookie, denies admin/cross-service/binding mismatch and token replay; central browser session preserved');
   service.users=[userId];await api('/api/admin/services/'+id,'PUT',service);
   const once=(await sdkCall('cpp','createLoginToken')).token;

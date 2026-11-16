@@ -46,6 +46,7 @@ class GatewayCheck extends HTMLElement {
     const text=this.textContent;this.replaceChildren();
     const label=document.createElement('label');label.className=this.hasAttribute('toggle')?'check toggle-control':'check';
     const input=document.createElement('input');input.type='checkbox';input.name=this.getAttribute('name') || '';input.value=this.getAttribute('value') || 'on';input.checked=this.hasAttribute('checked');
+    input.disabled=this.hasAttribute('disabled');
     if(this.hasAttribute('toggle'))input.setAttribute('role','switch');
     const decoration=document.createElement('span');decoration.className='check-decoration';decoration.setAttribute('aria-hidden','true');
     const caption=document.createElement('span');caption.textContent=text;

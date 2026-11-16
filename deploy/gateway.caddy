@@ -25,6 +25,7 @@ gateway.perfy576.com {
             request_header -X-Gateway-Backend-Host
             request_header -X-Gateway-Cookie
             request_header -X-Gateway-Set-Cookie
+            request_header -X-Gateway-Set-Session-Cookie
             request_header -X-Gateway-Token
             request_header -X-Gateway-User
             request_header -X-Gateway-User-Id
@@ -33,11 +34,13 @@ gateway.perfy576.com {
 
             forward_auth 127.0.0.1:19090 {
                 uri /internal/auth
-                copy_headers X-Gateway-Upstream X-Gateway-Transport X-Gateway-TLS-Name X-Gateway-Backend-Host X-Gateway-Cookie X-Gateway-Set-Cookie X-Gateway-Token X-Gateway-User X-Gateway-User-Id X-Gateway-Role X-Gateway-User-Info
+                copy_headers X-Gateway-Upstream X-Gateway-Transport X-Gateway-TLS-Name X-Gateway-Backend-Host X-Gateway-Cookie X-Gateway-Set-Cookie X-Gateway-Set-Session-Cookie X-Gateway-Token X-Gateway-User X-Gateway-User-Id X-Gateway-Role X-Gateway-User-Info
             }
 
             @issue_binding header_regexp X-Gateway-Set-Cookie .+
             header @issue_binding +Set-Cookie {http.request.header.X-Gateway-Set-Cookie}
+            @refresh_session header_regexp X-Gateway-Set-Session-Cookie .+
+            header @refresh_session +Set-Cookie {http.request.header.X-Gateway-Set-Session-Cookie}
 
             @https_backend header X-Gateway-Transport https
             handle @https_backend {
@@ -50,6 +53,7 @@ gateway.perfy576.com {
                     header_up -X-Gateway-Backend-Host
                     header_up -X-Gateway-Cookie
                     header_up -X-Gateway-Set-Cookie
+                    header_up -X-Gateway-Set-Session-Cookie
                     transport http {
                         tls
                         tls_server_name {http.request.header.X-Gateway-TLS-Name}
@@ -69,6 +73,7 @@ gateway.perfy576.com {
                     header_up -X-Gateway-Backend-Host
                     header_up -X-Gateway-Cookie
                     header_up -X-Gateway-Set-Cookie
+                    header_up -X-Gateway-Set-Session-Cookie
                     transport http {
                         dial_timeout 5s
                         response_header_timeout 30s

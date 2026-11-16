@@ -41,6 +41,12 @@ async function sdkVerify(language,input,code=0){
 function input(response,path,mode='local'){return {issuer:origin,audience:host,token:response.json.headers['x-gateway-token'],cookie:response.json.headers.cookie,method:'GET',uri:path,mode};}
 function sign(claims,version=1,key=secret){const header=Buffer.from(JSON.stringify({alg:'HS256',typ:'JWT',gwv:version})).toString('base64url');const payload=Buffer.from(JSON.stringify(claims)).toString('base64url');const data=header+'.'+payload;return data+'.'+createHmac('sha256',key).update(data).digest('base64url');}
 async function online(data,key=verificationKey){return request('/verify',{method:'POST',jar:false,headers:{Authorization:'Bearer '+key},body:{audience:data.audience,token:data.token,cookie:data.cookie,method:data.method,uri:data.uri}});}
+async function completeBusinessLogin(loginUrl){
+  const page=await request(loginUrl);assert.equal(page.status,200);
+  const token=new URL(loginUrl).searchParams.get('token');
+  const result=await api('/api/login','POST',{username:adminUsername,password,mode:'service',appid:'gateway-sdk-e2e',token});
+  const callback=await request(result.redirect);assert.equal(callback.status,302);return callback;
+}
 try{
   await api('/api/login','POST',{username:adminUsername,password,mode:'admin'});csrf=(await api('/api/me')).csrf;
   id=(await api('/api/admin/services','POST',{appid:'gateway-sdk-e2e',name:'SDK integration',host,upstream:'http://127.0.0.1:19093',enabled:true,allow_all:true,users:[],excluded_paths:['/public/*']})).id;
@@ -97,7 +103,7 @@ try{
     flow=await request(flow.headers.location);assert.equal(flow.status,302);const loginPage=flow.headers.location;
     const metadata=await api('/api/public?request='+encodeURIComponent(new URL(loginPage).searchParams.get('token')));
     assert.equal(metadata.sdk_version,'1.2.0');assert.equal(metadata.token_version,1);assert.equal(metadata.cookie_version,1);assert.equal(metadata.online_only,false);
-    flow=await request(loginPage);assert.equal(flow.status,302);flow=await request(flow.headers.location);assert.equal(flow.status,302);assert.equal(flow.headers.location,raw.uri);
+    flow=await completeBusinessLogin(loginPage);assert.equal(flow.headers.location,raw.uri);
     flow=await request(`https://${host}${raw.uri}`);assert.equal(flow.status,200,flow.text);
     const valid=await sdkVerify(language,{...input(flow,raw.uri),operation:'checkCookie',gateway_host:origin,appid:'gateway-sdk-e2e'});
     assert.equal(valid.result,'Ok');assert.equal(valid.allowed,true);assert.equal(valid.error,'');assert.equal(valid.redictUrl,'');assert.equal(valid.claims.client_sdk_version,'1.2.0');
@@ -105,7 +111,7 @@ try{
     flow=await request('/login?appid=gateway-sdk-e2e&token='+sign({...future,allow_verify:true},1,loginKey));assert.equal(flow.status,302);
     flow=await request(flow.headers.location);assert.equal(flow.status,302);
     const onlineMetadata=await api('/api/public?request='+encodeURIComponent(new URL(flow.headers.location).searchParams.get('token')));assert.equal(onlineMetadata.online_only,true);
-    flow=await request(flow.headers.location);assert.equal(flow.status,302);flow=await request(flow.headers.location);assert.equal(flow.status,302);
+    flow=await completeBusinessLogin(flow.headers.location);
     flow=await request(`https://${host}${raw.uri}`);assert.equal(flow.status,200,flow.text);
     const onlineInput={...input(flow,raw.uri),operation:'checkCookie',gateway_host:origin,appid:'gateway-sdk-e2e'};
     const unsupported=await sdkVerify(language,{...onlineInput,redirect_on_failure:false});
@@ -117,7 +123,7 @@ try{
   r=await request(`https://${host}/private?x=1`);assert.equal(r.status,302);
   const login=r.headers.location,loginToken=new URL(login).searchParams.get('token');
   const loginClaims=JSON.parse(Buffer.from(loginToken.split('.')[1],'base64url'));assert.equal(loginClaims.ver,1);
-  r=await request(login);assert.equal(r.status,302);r=await request(r.headers.location);assert.equal(r.status,302);
+  r=await completeBusinessLogin(login);
   r=await request(`https://${host}/private?x=1`);assert.equal(r.status,200,r.text);const authenticated=input(r,'/private?x=1');
   for(const lang of ['python','cpp'])for(const mode of ['local','online']){
     const verified=await sdkVerify(lang,{...authenticated,mode,require_authenticated:true});assert.equal(verified.claims.username,adminUsername);assert.equal(verified.claims.authenticated,true);
