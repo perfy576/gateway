@@ -55,10 +55,30 @@ async function renderLogin(admin=false) {
   const params=new URLSearchParams(location.search),request=params.get('token') || params.get('request') || '',appid=params.get('appid') || '';let data;
   if(!admin) {
     try { data=await api('/api/public?token='+encodeURIComponent(request)+'&appid='+encodeURIComponent(appid)); }
-    catch(error) { app.innerHTML=`<div class="auth-page"><header class="auth-header">${brand()}</header><div class="auth-main"><h1>登录请求已失效</h1><p class="muted">${esc(error.message)}</p><a href="/">返回首页</a></div></div>`;refreshIcons();return; }
+    catch(error) { app.innerHTML=`<div class="auth-page login-page"><header class="auth-header">${brand()}</header><div class="auth-main"><h1>登录请求已失效</h1><p class="muted">${esc(error.message)}</p><a href="/">返回首页</a></div></div>`;refreshIcons();return; }
   }
-  app.innerHTML=`<div class="auth-page"><header class="auth-header">${brand()}<span class="muted">${admin?'管理控制台':'统一身份认证'}</span></header><section class="auth-main"><h1>${admin?'控制台登录':'登录'}</h1><p class="muted">${admin?'Gateway 控制台':'身份验证'}</p>${admin?'':`<div class="login-target"><span class="target-symbol">${icon('app-window')}</span><div><span class="target-caption">访问服务</span><h2>${esc(data.service.name)}</h2><p class="mono">${esc(data.service.host)}</p></div>${icon('lock-keyhole')}</div><div class="return-address mono" title="${esc(data.return_url)}">${esc(new URL(data.return_url).pathname+new URL(data.return_url).search)}</div>`}<form id="login-form"><div class="error" id="login-error"></div>${field('用户名','username','','text','autocomplete="username" maxlength="64" required')}${passwordField('密码','password')}<button class="primary" type="submit">登录 ${icon('arrow-right')}</button></form></section><footer class="auth-footer">${esc(location.host)}</footer></div>`;
+  const quick=data?.quick_login;
+  if(quick)csrfToken=quick.csrf;
+  const quickPanel=quick?`<div id="quick-login"><div class="quick-account"><span class="avatar">${icon('user-round')}</span><div><p>${esc(quick.user.display_name)}</p><p class="muted mono">${esc(quick.user.username)}</p></div></div><div class="error" id="quick-login-error" role="alert">${quick.permitted?'':'当前账号无权访问目标服务，请切换账号'}</div><button type="button" class="primary" id="quick-login-button" ${quick.permitted?'':'disabled aria-describedby="quick-login-error"'}>快捷登录 ${icon('arrow-right')}</button><button type="button" class="login-switch" id="switch-account">切换账号</button></div>`:'';
+  app.innerHTML=`<div class="auth-page login-page"><header class="auth-header">${brand()}<span class="muted">${admin?'管理控制台':'统一身份认证'}</span></header><section class="auth-main"><h1>${admin?'控制台登录':'登录'}</h1><p class="muted">${admin?'Gateway 控制台':'身份验证'}</p>${admin?'':`<div class="login-target"><span class="target-symbol">${icon('app-window')}</span><div><span class="target-caption">访问服务</span><h2>${esc(data.service.name)}</h2><p class="mono">${esc(data.service.host)}</p></div>${icon('lock-keyhole')}</div><div class="return-address mono" title="${esc(data.return_url)}">${esc(new URL(data.return_url).pathname+new URL(data.return_url).search)}</div>`}${quickPanel}<form id="login-form" ${quick?'hidden':''}><div class="error" id="login-error" role="alert"></div>${field('用户名','username','','text','autocomplete="username" autocapitalize="none" spellcheck="false" enterkeyhint="next" maxlength="64" required')}${passwordField('密码','password')}<button class="primary" type="submit">登录 ${icon('arrow-right')}</button>${quick?'<button type="button" class="login-switch" id="use-current-account">使用当前账号</button>':''}</form></section><footer class="auth-footer">${esc(location.host)}</footer></div>`;
+  app.querySelector('#f-password').enterKeyHint='go';
   refreshIcons();
+  app.querySelector('#switch-account')?.addEventListener('click',()=>{
+    app.querySelector('#quick-login').hidden=true;app.querySelector('#login-form').hidden=false;
+    app.querySelector('#f-username').focus();
+  });
+  app.querySelector('#use-current-account')?.addEventListener('click',()=>{
+    app.querySelector('#login-form').reset();app.querySelector('#login-error').textContent='';
+    app.querySelector('#login-form').hidden=true;app.querySelector('#quick-login').hidden=false;
+    app.querySelector(quick.permitted?'#quick-login-button':'#switch-account').focus();
+  });
+  app.querySelector('#quick-login-button')?.addEventListener('click',async event=>{
+    const button=event.currentTarget;button.disabled=true;app.querySelector('#quick-login-error').textContent='';
+    try {
+      const result=await api('/api/login/quick',{method:'POST',body:JSON.stringify({token:request,appid})});
+      location.href=result.redirect;
+    }catch(error){app.querySelector('#quick-login-error').textContent=error.message;button.disabled=false;}
+  });
   app.querySelector('#login-form').addEventListener('submit',async event=>{
     event.preventDefault();const button=event.submitter;button.disabled=true;app.querySelector('#login-error').textContent='';
     const form=new FormData(event.currentTarget);

@@ -50,7 +50,7 @@ sequenceDiagram
     B->>C: 访问业务域名 /path?query
     C->>G: 认证子请求（不转发正文）
     G-->>B: 302 /login?appid=服务ID&token=签名请求 + 浏览器绑定 Cookie
-    B->>G: 登录（只读目标服务）
+    B->>G: 快捷登录或输入账号密码（只读目标服务）
     G-->>B: 一次性回跳凭据
     B->>C: 业务域名 /_gateway/callback
     C->>G: 消费回跳凭据 + 校验浏览器 Cookie
@@ -65,7 +65,7 @@ sequenceDiagram
 - 会话：256 位密码学随机凭据，值为 `v1.<64位hex>`，内存只记录 SHA-256 摘要；控制台及业务有效期都由域名单独设置，`GATEWAY_SESSION_SECONDS` 仅用于首次创建内置控制台时的默认值。Cookie 使用 `__Host-`、`Secure`、`HttpOnly`、`SameSite=Lax`，无共享 Domain。登录态还绑定独立的 `__Host-gateway_binding` Cookie、业务 ID 和域名。后端访问 JWT 最长 60 秒，也不会超过当前业务会话的到期时间。
 - 登录请求：HS256 签名，包含 `ver=1`、`type=login_request`、`appid`、`service_id`、完整 `return_url`、`iat`、`exp`、`jti`，5 分钟过期；JWT 头包含 `gwv=1`。内存同时保存对应摘要和目标信息。浏览器请求使用服务 Secret 通过 `gateway/browser-login/v1` 派生的密钥；SDK 请求使用独立上下文 `gateway/sdk-login/v1`，防止混用。重启后浏览器流程和已签发会话失效。
 - 回跳：一次性随机 ticket，30 秒过期，绑定原浏览器、服务和登录请求；消费后删除。
-- 账号密码通用，登录态按业务隔离：控制台登录不能自动完成业务登录，业务 A 登录不能自动完成业务 B 登录；每个业务首次访问需独立输入账号密码。业务登录只在回跳后设置目标域名的 Cookie，不创建或替换控制台会话。
+- 账号密码通用，登录态按业务隔离。跳转至业务登录页时，如果 Gateway 控制台已有有效登录，页面显示当前账号和「快捷登录」按钮，点击后使用当前账号登录目标业务；页面展示及提交时都会校验目标业务权限，管理员也受业务白名单限制。无权限时按钮禁用，可点击下方灰色的「切换账号」输入其他账号密码；切换账号仅用于本次业务登录，不改变 Gateway 控制台的登录账号。没有控制台登录时直接显示账号密码表单。快捷登录使用带会话 CSRF 校验的 `POST /api/login/quick`，仍经过一次性 ticket 和原浏览器绑定校验，业务 Cookie 只在目标域名回跳成功后设置。
 - 「有效会话」可按业务或控制台筛选，显示所属业务、域名、在线状态、最后访问时间和剩余有效期；`expires_at=0` 表示无限。最近 60 秒内有通过认证的请求才算在线，超过 60 秒但 Cookie 未过期的仍属于有效会话。页面和用户列表以「在线 / 有效」展示数量；会话页每 10 秒自动刷新，查询列表不会把其他会话标为在线。列表中的撤销按钮只撤销该条会话，用户管理中的撤销操作仍撤销该用户的全部会话。
 - 会话、浏览器登录流程、ticket 和接口 Token 已用标记都只在内存里；重启后会话与浏览器流程失效，已用标记清空。SDK 自签 Token 仍受 5 分钟有效期约束。用户、服务配置、后端签名密钥和审计记录在 MySQL 中。
 - 无登录态的 GET/HEAD 重定向；POST/PUT 等请求返回 401 和 `login_url` / `X-Gateway-Login`，避免静默丢失正文。
@@ -177,6 +177,10 @@ C++ 只监听 `127.0.0.1:19090`。公网不可暴露 `/internal/*`。Caddy 管�
 `web/components.js` 提供 `<gw-select>`、`<gw-option>` 和 `<gw-checkbox>` 组件。下拉框自绘，支持键盘选择、Esc、焦点和原生 FormData；复选框/开关以可访问的表单输入承载自定义外观。弹窗和字段通过 `showModal()`、`field()` 等复用。没有原生下拉菜单。
 
 `node tools/session-integration.mjs` 验证控制台与业务隔离、跨业务 Cookie 拒绝、用户白名单（含管理员）、授权撤销、单会话撤销、小数有效期和无限会话。默认直连本机 19090，可用 `GATEWAY_TEST_PORT` 指定独立测试网关；测试创建的业务和账号会在结束后清理。
+
+`node tools/quick-login-integration.mjs` 验证快捷登录、权限变更、CSRF、回跳防重放、会话撤销，以及桌面/手机浏览器中的快捷登录和切换账号。支持 `GATEWAY_TEST_PORT` 指定独立测试网关，浏览器通过本地 TLS relay 访问该实例，不经过线上 Caddy；`GATEWAY_TEST_TLS_PORT` 默认 19445。测试结束会清理临时服务、用户和 TLS 文件，截图保存在 `artifacts/quick-login-*.png`。
+
+所有 JSON 接口同时接受 `Content-Length` 和 `Transfer-Encoding: chunked` 请求，后者由 Workflow 解码后再解析 JSON，兼容 Flutter 原生控制台等分块客户端。`node tools/chunked-json-integration.mjs` 经 Caddy 验证分块登录、中文正文、管理写入及错误响应；设置 `GATEWAY_TEST_PORT` 可改为直连独立测试实例。临时业务、用户和测试自身的控制台会话会在结束后清理。
 
 `node tools/console-integration.mjs` 验证内置控制台的删除/路由保护、管理员固定授权、普通用户授权与管理权限隔离、控制台 Cookie 续期，以及等待 61 秒后的离线但有效状态；同样支持 `GATEWAY_TEST_PORT`。临时用户在结束后删除，控制台配置恢复到测试前状态。
 

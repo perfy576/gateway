@@ -299,8 +299,8 @@ static void csrf(WFHttpTask *task, bool authenticated) {
         throw HttpError(403,"会话校验失败，请刷新页面");
 }
 static json body(WFHttpTask *task) {
-    const void *data; size_t size; task->get_req()->get_parsed_body(&data,&size);
-    auto value=json::parse(std::string(static_cast<const char *>(data),size),nullptr,false);
+    auto data=protocol::HttpUtil::decode_chunked_body(task->get_req());
+    auto value=json::parse(data,nullptr,false);
     if (!value.is_object()) throw HttpError(400,"请求 JSON 无效");
     return value;
 }
@@ -757,10 +757,25 @@ static void dispatch(WFHttpTask *task) {
         auto s=c->services.find(flow.service_id);
         if (s==c->services.end() || !s->second.enabled) throw HttpError(410,"目标服务已停用");
         if(!params["token"].empty()&&params["appid"]!=s->second.appid)throw HttpError(400,"AppID 与登录 Token 不匹配");
+        auto user=current_user(task,*c,false);
+        json quick_login=nullptr;
+        if(!user.id.empty())quick_login={{"user",user_json(user)},{"permitted",permitted(s->second,user)},
+            {"csrf",sha256("csrf:"+cookie(task,"__Host-gateway_session"))}};
         respond(task,200,{{"service",{{"id",s->second.id},{"appid",s->second.appid},{"name",s->second.name},{"host",s->second.host}}},
             {"return_url","https://"+s->second.host+flow.path},{"expires_at",flow.expires},
             {"sdk_version",flow.protocol.sdk_version},{"token_version",flow.protocol.token_version},
-            {"cookie_version",flow.protocol.cookie_version},{"online_only",flow.protocol.online_only}}); return;
+            {"cookie_version",flow.protocol.cookie_version},{"online_only",flow.protocol.online_only},{"quick_login",quick_login}}); return;
+    }
+    if (path=="/api/login/quick" && method=="POST") {
+        std::lock_guard lock(control_mutex);
+        auto live=snapshot();auto user=current_user(task,*live);
+        csrf(task,true);rate_limit("quick-login:"+user.id,30);
+        auto b=body(task);auto request=text_field(b,"token",1,16384);
+        auto [id,flow]=checked_flow(request);const auto& service=live->services.at(flow.service_id);
+        if(b.contains("appid")&&b.at("appid")!=service.appid)throw HttpError(400,"AppID 与登录 Token 不匹配");
+        if(!permitted(service,user))throw HttpError(403,"当前账号无权访问目标服务，请切换账号");
+        audit(task,user.username,"login.success","appid="+service.appid+"; method=quick");
+        respond(task,200,{{"redirect",authorization_url(*live,user,request)}});return;
     }
     if (path=="/api/login" && method=="POST") {
         csrf(task,false); auto b=body(task);
@@ -916,7 +931,7 @@ static void process(WFHttpTask *task) {
     r->set_header_pair("X-Frame-Options","DENY");
     r->set_header_pair("Content-Security-Policy","default-src 'self'; script-src 'self'; style-src 'self'; img-src 'self' data:; font-src 'self'; connect-src 'self'; frame-ancestors 'none'; base-uri 'none'; form-action 'self'");
     auto path=std::string(task->get_req()->get_request_uri()); path=path.substr(0,path.find('?'));
-    bool slow=(path=="/login"&&std::string(task->get_req()->get_method())=="POST") || path=="/api/login" || path=="/api/logout" || path=="/api/password" || path.rfind("/api/admin/",0)==0;
+    bool slow=(path=="/login"&&std::string(task->get_req()->get_method())=="POST") || path=="/api/login" || path=="/api/login/quick" || path=="/api/logout" || path=="/api/password" || path.rfind("/api/admin/",0)==0;
     if (!slow) { safely(task); return; }
     if (pending.fetch_add(1)>=128) {
         --pending; respond_error(task,503,"服务繁忙，请稍后重试"); return;
