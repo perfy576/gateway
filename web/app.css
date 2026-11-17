@@ -13,6 +13,8 @@ input[readonly],textarea[readonly]{background:#f5f7f8;color:#66747b}gw-checkbox[
 .home-notice{display:flex;align-items:flex-start;gap:12px;padding:20px 40px;background:#fff6f3;border-bottom:1px solid #edddd7;color:#8a4338}.home-notice>svg{margin-top:3px;width:20px;height:20px}.home-notice>div{min-width:0}.home-notice h2{font-size:15px}.home-notice p{font-size:13px;margin-top:5px;overflow-wrap:anywhere}.home-notice .mono{display:inline-block;margin-left:8px;color:#89695f}.home-notice .muted{font-size:12px;color:#8b7972}
 @media(max-width:700px){.home-notice{padding:18px 20px}.home-notice .mono{display:block;margin:3px 0 0}}
 .login-page{min-height:100vh;min-height:100dvh}.login-page .auth-header{flex-shrink:0}.login-page .auth-main{min-width:0}.login-page .error,.login-page .auth-footer{overflow-wrap:anywhere}
+.client-info{width:240px;max-width:280px;white-space:normal;overflow-wrap:anywhere}.client-agent{font-size:12px;line-height:1.6}.client-agent summary{display:flex;align-items:flex-start;gap:6px;cursor:pointer;list-style:none}.client-agent summary::-webkit-details-marker{display:none}.client-agent summary>svg{width:12px;height:16px;margin-top:2px}.client-agent-preview{display:-webkit-box;-webkit-box-orient:vertical;-webkit-line-clamp:3;overflow:hidden}.client-agent-label{display:none}.client-agent[open] .client-agent-label{display:inline}.client-agent[open] .client-agent-preview{display:none}.client-agent[open] summary>svg{transform:rotate(90deg)}.client-agent-full{margin:6px 0 0 18px}
+@media(pointer:coarse){.client-agent summary{min-height:44px}}
 @media(max-width:700px),(pointer:coarse){
   .login-page input{font-size:16px;line-height:1.5;min-height:48px;padding:11px 12px}
   .login-page .password-input input{padding-right:52px}

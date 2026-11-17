@@ -70,12 +70,16 @@ struct ClientProtocol {
     int token_version=TOKEN_VERSION,cookie_version=COOKIE_VERSION;
     bool online_only=false;
 };
+struct ClientInfo {
+    std::string user_agent, app_package;
+};
 struct Session {
     std::string user_id, ip, host, binding_hash;
     long long expires, created;
     ClientProtocol protocol;
     std::string service_id;
     long long cookie_lifetime, cookie_refreshed, last_seen;
+    ClientInfo client;
 };
 static std::unordered_map<std::string,Session> sessions;
 static std::shared_mutex session_mutex;
@@ -121,6 +125,16 @@ static const Service& console_service(const Config& c) {
 static std::string header(WFHttpTask *task, const std::string& name) {
     protocol::HttpHeaderCursor cursor(task->get_req()); std::string value;
     cursor.find(name, value); return value;
+}
+static ClientInfo client_info(WFHttpTask *task) {
+    auto agent=header(task,"User-Agent").substr(0,1024);
+    for(auto& c:agent)if(static_cast<unsigned char>(c)<32 || c==127)c=' ';
+    // Keep arbitrary header bytes valid UTF-8 for both JSON and MySQL.
+    agent=json::parse(json(agent).dump(-1,' ',false,json::error_handler_t::replace)).get<std::string>();
+    auto package=header(task,"X-Gateway-App-Package");
+    static const std::regex package_pattern(R"(^[A-Za-z0-9][A-Za-z0-9_.-]{0,254}$)");
+    if(!std::regex_match(package,package_pattern))package.clear();
+    return {agent,package};
 }
 static std::string cookie(WFHttpTask *task, const std::string& name) {
     try { return cookie_value(header(task,"Cookie"),name); }
@@ -283,7 +297,7 @@ static IssuedSession issue_session(WFHttpTask *task,const User& user,const std::
     if (sessions.size()>=100000) throw HttpError(503,"会话数量已达上限");
     if(replace_browser_session){auto old=session_key(task);if(!old.empty())sessions.erase(old);}
     auto t=now();
-    sessions[sha256(token)]={user.id,ip(task),host,sha256(binding),session_expires_at(t,lifetime),t,protocol,scope,lifetime,t,t};
+    sessions[sha256(token)]={user.id,ip(task),host,sha256(binding),session_expires_at(t,lifetime),t,protocol,scope,lifetime,t,t,client_info(task)};
     return {token,binding,lifetime};
 }
 static void new_session(WFHttpTask *task, const User& user,const ClientProtocol& protocol={},const std::string& service_id={}) {
@@ -312,7 +326,9 @@ static std::string text_field(const json& b, const char *key, size_t minimum, si
     return value;
 }
 static void audit(WFHttpTask *task, const std::string& actor, const std::string& action, const std::string& detail) {
-    db().query("INSERT INTO audit_logs(actor,action,detail,ip) VALUES(?,?,?,?)",{actor,action,detail.substr(0,2048),ip(task)});
+    auto client=client_info(task);
+    db().query("INSERT INTO audit_logs(actor,action,detail,ip,user_agent,app_package) VALUES(?,?,?,?,?,?)",
+        {actor,action,detail.substr(0,2048),ip(task),client.user_agent,client.app_package});
 }
 static bool excluded_path(const Service& service, const std::string& uri) {
     auto path=uri.substr(0,uri.find('?'));
@@ -593,7 +609,7 @@ static json session_list(const Config& c) {
             {"ip",s.ip},{"created_at",s.created},{"expires_at",expires},{"host",s.host},
             {"service_id",s.service_id},{"appid",service?service->appid:""},{"service_name",service?service->name:"Gateway 控制台"},
             {"scope",service&&service->builtin?"admin":"service"},{"last_seen_at",s.last_seen},
-            {"online",session_is_online(s.last_seen,now())}});
+            {"online",session_is_online(s.last_seen,now())},{"user_agent",s.client.user_agent},{"app_package",s.client.app_package}});
     }
     return result;
 }
@@ -835,8 +851,9 @@ static void dispatch(WFHttpTask *task) {
         }
         if (path=="/api/admin/audit" && method=="GET") {
             json entries=json::array();
-            for (const auto& r:db().query("SELECT id,actor,action,detail,ip,created_at FROM audit_logs ORDER BY id DESC LIMIT 100"))
-                entries.push_back({{"id",r[0]},{"actor",r[1]},{"action",r[2]},{"detail",r[3]},{"ip",r[4]},{"created_at",r[5]}});
+            for (const auto& r:db().query("SELECT id,actor,action,detail,ip,created_at,user_agent,app_package FROM audit_logs ORDER BY id DESC LIMIT 100"))
+                entries.push_back({{"id",r[0]},{"actor",r[1]},{"action",r[2]},{"detail",r[3]},{"ip",r[4]},{"created_at",r[5]},
+                    {"user_agent",r[6]},{"app_package",r[7]}});
             respond(task,200,{{"entries",entries}}); return;
         }
         std::lock_guard lock(control_mutex);

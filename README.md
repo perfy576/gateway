@@ -145,6 +145,8 @@ make test
 
 `sudo make install` 安装网关二进制，支持 `PREFIX` 和 `DESTDIR`；不会自动覆盖环境配置、部署页面或重启运行中的服务。
 
+会话和审计接口返回 `user_agent`、`app_package`，Web 控制台及 Flutter 控制台均展示客户端信息。User-Agent 最多采集 1024 字节并修复无效 UTF-8；包名来自可选的 `X-Gateway-App-Package` 请求头，最长 255 个 ASCII 字符（字母、数字、点、下划线、短横线，首字符为字母或数字），非法值忽略。这些字段仅供审计，不用于认证或授权。会话保留登录时的客户端信息，审计记录每次操作请求的客户端信息；历史记录的客户端为空。已有数据库先由管理员执行 `migrations/004-client-info.sql` 一次，再更新程序和页面；新部署的 `schema.sql` 已包含字段。Flutter/Dart SDK 1.3.0 支持可选包名及 User-Agent 上报，旧客户端仍兼容。
+
 运行文件：
 
 - 程序：`/usr/local/bin/gateway`
@@ -181,6 +183,8 @@ C++ 只监听 `127.0.0.1:19090`。公网不可暴露 `/internal/*`。Caddy 管�
 `node tools/quick-login-integration.mjs` 验证快捷登录、权限变更、CSRF、回跳防重放、会话撤销，以及桌面/手机浏览器中的快捷登录和切换账号。支持 `GATEWAY_TEST_PORT` 指定独立测试网关，浏览器通过本地 TLS relay 访问该实例，不经过线上 Caddy；`GATEWAY_TEST_TLS_PORT` 默认 19445。测试结束会清理临时服务、用户和 TLS 文件，截图保存在 `artifacts/quick-login-*.png`。
 
 所有 JSON 接口同时接受 `Content-Length` 和 `Transfer-Encoding: chunked` 请求，后者由 Workflow 解码后再解析 JSON，兼容 Flutter 原生控制台等分块客户端。`node tools/chunked-json-integration.mjs` 经 Caddy 验证分块登录、中文正文、管理写入及错误响应；设置 `GATEWAY_TEST_PORT` 可改为直连独立测试实例。临时业务、用户和测试自身的控制台会话会在结束后清理。
+
+`node tools/client-info-integration.mjs` 验证控制台、浏览器、快捷登录和 App 登录的会话及审计客户端信息，也覆盖旧客户端缺省值、包名校验、UA 长度限制和失败登录记录。支持 `GATEWAY_TEST_PORT`，临时服务及测试会话会在结束后清理。
 
 `node tools/console-integration.mjs` 验证内置控制台的删除/路由保护、管理员固定授权、普通用户授权与管理权限隔离、控制台 Cookie 续期，以及等待 61 秒后的离线但有效状态；同样支持 `GATEWAY_TEST_PORT`。临时用户在结束后删除，控制台配置恢复到测试前状态。
 
