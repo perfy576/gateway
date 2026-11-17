@@ -1,9 +1,13 @@
 #include "security.h"
+#include "password_cipher.h"
 #include "gateway_identity.h"
 #include "session_policy.h"
 #include <functional>
 #include <iostream>
 #include <limits>
+#include <filesystem>
+#include <sys/stat.h>
+#include <unistd.h>
 
 static void require(bool value,const char *message) { if (!value) throw std::runtime_error(message); }
 static void rejects(const std::function<void()>& action) {
@@ -56,6 +60,20 @@ int main() {
     require(password_verify("correct-horse-example",hash),"Password round trip");
     require(!password_verify("incorrect",hash),"Wrong password");
     require(password_hash("correct-horse-example")!=hash,"Unique salts");
+    char key_dir[]="/tmp/gateway-password-key-XXXXXX";
+    require(mkdtemp(key_dir)!=nullptr,"Create password key test directory");
+    struct Cleanup {std::string path;~Cleanup(){std::filesystem::remove_all(path);}} cleanup{key_dir};
+    const auto key_path=std::string(key_dir)+"/private.pem";
+    PasswordCipher cipher(key_path),restored(key_path);
+    require(cipher.public_key()==restored.public_key(),"Persistent password encryption key");
+    require(!cipher.public_key().contains("d")&&cipher.public_key().at("alg")=="RSA-OAEP-256","Public encryption key only");
+    struct stat key_stat{};require(stat(key_path.c_str(),&key_stat)==0&&(key_stat.st_mode&0777)==0600,"Private key permissions");
+    const auto link=std::string(key_dir)+"/link.pem";
+    require(symlink(key_path.c_str(),link.c_str())==0,"Create key symlink test");
+    rejects([&]{PasswordCipher unsafe(link);});
+    require(chmod(key_path.c_str(),0644)==0,"Set unsafe key permissions");
+    rejects([&]{PasswordCipher unsafe(key_path);});
+    require(chmod(key_path.c_str(),0600)==0,"Restore key permissions");
     require(!valid_path("//evil.invalid") && !valid_path("/%2fevil.invalid") && !valid_path("/\\evil.invalid"),"Redirect safety");
     require(valid_path("/original?x=1&y=2"),"Return URL");
     require(parse_upstream("https://remote.example.com:8443").hostname=="remote.example.com","Remote upstream");

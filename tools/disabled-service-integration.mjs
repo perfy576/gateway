@@ -1,4 +1,5 @@
 import assert from 'node:assert/strict';
+import {protectPasswordBody} from './password-envelope.mjs';
 import http from 'node:http';
 import https from 'node:https';
 import {randomBytes} from 'node:crypto';
@@ -12,6 +13,7 @@ const username=record.match(/^Username: (.+)$/m)[1],password=record.match(/^Pass
 const suffix=randomBytes(4).toString('hex'),service={appid:'disabled-test-'+suffix,name:'停用服务测试',host:'disabled-test-'+suffix+'.invalid',upstream:'http://127.0.0.1:19091',enabled:false,allow_all:true,users:[],excluded_paths:['/*'],cookie_max_age_hours:12};
 const client=await request.newContext({baseURL:origin});let id='',csrf='';
 async function api(path,method='GET',data){
+  data=await protectPasswordBody(path,method,data,target=>api(target));
   const response=await client.fetch(path,{method,data,headers:{Origin:origin,'X-Gateway-Request':'1','X-CSRF-Token':csrf}}).catch(()=>{throw new Error('API network failure: '+path);});
   assert.equal(response.status(),200,'API failed: '+path);return response.json();
 }

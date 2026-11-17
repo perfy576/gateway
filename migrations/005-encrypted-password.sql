@@ -1,0 +1,2 @@
+ALTER TABLE users
+ ADD COLUMN last_password_verified_at_ms BIGINT UNSIGNED NOT NULL DEFAULT 0;

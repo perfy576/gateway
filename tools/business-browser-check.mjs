@@ -1,4 +1,5 @@
 import assert from 'node:assert/strict';
+import {protectPasswordBody} from './password-envelope.mjs';
 import http from 'node:http';
 import https from 'node:https';
 import {readFileSync} from 'node:fs';
@@ -36,6 +37,7 @@ const browser=await chromium.launch({headless:true,executablePath:process.env.CH
 let id,csrf,userId;
 const admin=await browser.newContext({locale:'zh-CN',ignoreHTTPSErrors:true});
 async function api(path,method='GET',body) {
+  body=await protectPasswordBody(path,method,body,target=>api(target));
   const response=await admin.request.fetch(origin+path,{method,headers:{'X-Gateway-Request':'1','X-CSRF-Token':csrf || '',Origin:origin,'Content-Type':'application/json'},data:body});
   const result=await response.json();assert.equal(response.status(),200,JSON.stringify(result));return result;
 }

@@ -1,4 +1,5 @@
 import assert from 'node:assert/strict';
+import {protectPasswordBody} from './password-envelope.mjs';
 import http from 'node:http';
 import https from 'node:https';
 import {readFileSync} from 'node:fs';
@@ -16,8 +17,9 @@ const sockets=new Set();
 const backend=http.createServer((req,res)=>{res.writeHead(200,{'Content-Type':'application/json'});res.end(JSON.stringify({headers:req.headers,url:req.url}));});
 backend.on('connection',socket=>{sockets.add(socket);socket.on('error',()=>{});socket.on('close',()=>sockets.delete(socket));});
 await new Promise(resolve=>backend.listen(19094,'127.0.0.1',resolve));
-function request(url,options={}){
+async function request(url,options={}){
   const u=new URL(url,origin),headers={Host:u.hostname,...options.headers};
+  options={...options,body:await protectPasswordBody(u.pathname+u.search,options.method||'GET',options.body,async path=>(await request(path,{admin:options.admin})).json)};
   if(options.admin)headers.Cookie=adminCookie;
   let data=options.body;
   if(data!==undefined&&typeof data!=='string'){data=JSON.stringify(data);headers['Content-Type']='application/json';}

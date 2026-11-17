@@ -1,4 +1,5 @@
 import assert from 'node:assert/strict';
+import {protectPasswordBody} from './password-envelope.mjs';
 import http from 'node:http';
 import https from 'node:https';
 import {readFileSync} from 'node:fs';
@@ -13,8 +14,9 @@ const jars=new Map();let csrf='',id='',secret='',verificationKey='';
 const sockets=new Set();const backend=http.createServer((req,res)=>{res.writeHead(200,{'Content-Type':'application/json'});res.end(JSON.stringify({headers:req.headers,url:req.url}));});
 backend.on('connection',socket=>{sockets.add(socket);socket.on('close',()=>sockets.delete(socket));});
 await new Promise(resolve=>backend.listen(19093,'127.0.0.1',resolve));
-function request(url,options={}){
+async function request(url,options={}){
   const u=new URL(url,origin),headers={Host:u.hostname,...options.headers};
+  options={...options,body:await protectPasswordBody(u.pathname,options.method||'GET',options.body,async path=>(await request(path,{jar:options.jar})).json)};
   if(options.jar!==false)headers.Cookie=[...(jars.get(u.hostname)||new Map())].map(([k,v])=>k+'='+v).join('; ');
   let body;
   if(options.body!==undefined){body=JSON.stringify(options.body);Object.assign(headers,{'Content-Type':'application/json','Content-Length':Buffer.byteLength(body),'X-Gateway-Request':'1','X-CSRF-Token':csrf,Origin:origin});}

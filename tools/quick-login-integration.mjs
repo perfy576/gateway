@@ -1,4 +1,5 @@
 import assert from 'node:assert/strict';
+import {protectPasswordBody} from './password-envelope.mjs';
 import http from 'node:http';
 import https from 'node:https';
 import {readFileSync,mkdtempSync,rmSync,mkdirSync} from 'node:fs';
@@ -19,8 +20,10 @@ const ordinary='quick_user_'+suffix,ordinaryPassword=randomBytes(18).toString('h
 const config={appid:'quick-login-'+suffix,name:'Quick login test',host,upstream:'http://127.0.0.1:19091',enabled:true,allow_all:true,users:[],excluded_paths:[]};
 const jars=new Map(),sockets=new Set(),errors=[];
 let csrf='',serviceId,userId,browser,relay,tlsDir;
+let encryptedBrowserLogins=0;
 const cookieFor=(jar,domain)=>[...(jar?.get(domain)||new Map())].map(([k,v])=>k+'='+v).join('; ');
 async function request(path,{host:domain=gateway,method='GET',body,headers={},jar=jars,csrfToken=csrf}={}) {
+  body=await protectPasswordBody(path,method,body,async target=>(await request(target,{jar,csrfToken})).json);
   const encoded=body===undefined?undefined:Buffer.isBuffer(body)?body:Buffer.from(JSON.stringify(body));
   const requestHeaders={Host:domain,Cookie:cookieFor(jar,domain)};
   if(encoded)Object.assign(requestHeaders,{'Content-Type':'application/json','Content-Length':encoded.length,Origin:origin,'X-Gateway-Request':'1','X-CSRF-Token':csrfToken});
@@ -63,6 +66,12 @@ async function browserContext(withConsole=true) {
   context.setDefaultTimeout(15000);
   if(withConsole)await context.addCookies([...jars.get(gateway)].map(([name,value])=>({name,value,url:origin,secure:true,httpOnly:true,sameSite:'Lax'})));
   const page=await context.newPage();page.on('pageerror',error=>errors.push(error.message));
+  page.on('request',request=>{
+    if(new URL(request.url()).pathname!=='/api/login'||request.method()!=='POST')return;
+    const body=request.postDataJSON();
+    if(body.password!==undefined||body.passwd!==undefined||body.password_envelope?.split('.').length!==5)errors.push('Browser login did not use encrypted password transport');
+    encryptedBrowserLogins++;
+  });
   return {context,page};
 }
 async function screenshot(page,label,width,height) {
@@ -190,7 +199,7 @@ try {
   assert.equal(JSON.parse(await second.page.locator('body').textContent()).claims.username,ordinary);
   assert.deepEqual((await second.context.cookies(origin)).map(({name,value})=>[name,value]).sort(),[...jars.get(gateway)].sort());
   await second.page.goto(origin+'/api/me');assert.equal(JSON.parse(await second.page.locator('body').textContent()).user.username,username);
-  await second.context.close();assert.deepEqual(errors,[]);
+  await second.context.close();assert.deepEqual(errors,[]);assert(encryptedBrowserLogins>0);
   console.log('PASS desktop/mobile quick login, anonymous fallback, disabled unauthorized button, switching accounts and unchanged Gateway identity');
 }finally {
   await browser?.close();for(const socket of sockets)socket.destroy();

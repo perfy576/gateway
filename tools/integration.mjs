@@ -1,4 +1,5 @@
 import assert from 'node:assert/strict';
+import {protectPasswordBody} from './password-envelope.mjs';
 import http from 'node:http';
 import https from 'node:https';
 import {readFileSync,writeFileSync} from 'node:fs';
@@ -16,8 +17,9 @@ let csrf='', id='', secret='', otherUser='',secondId='';
 const result=[];
 function check(name) { result.push(name); console.log('PASS '+name); }
 function cookiesFor(host) {return [...(jar.get(host) || new Map())].map(([k,v])=>`${k}=${v}`).join('; ');}
-function request(url, options={}) {
+async function request(url, options={}) {
   const parsed=new URL(url,origin), host=parsed.hostname;
+  options={...options,body:await protectPasswordBody(parsed.pathname,options.method||'GET',options.body,async path=>(await request(path,{jar:options.jar})).json)};
   const headers={Host:host,...options.headers};
   if(options.jar!==false) headers.Cookie=cookiesFor(host);
   let data=options.body;

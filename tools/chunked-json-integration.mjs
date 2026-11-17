@@ -1,4 +1,5 @@
 import assert from 'node:assert/strict';
+import {protectPasswordBody} from './password-envelope.mjs';
 import http from 'node:http';
 import https from 'node:https';
 import {readFileSync} from 'node:fs';
@@ -11,6 +12,7 @@ const username=record.match(/^Username: (.+)$/m)[1],password=record.match(/^Pass
 const cookies=new Map(),suffix=randomBytes(4).toString('hex');
 let csrf='',userId,serviceId;
 async function request(path,{method='GET',body,rawBody,chunked=false,headers={}}={}) {
+  body=await protectPasswordBody(path,method,body,async target=>(await request(target)).json);
   const payload=rawBody!==undefined?Buffer.from(rawBody):body===undefined?undefined:Buffer.from(JSON.stringify(body));
   const requestHeaders={Host:host,Cookie:[...cookies].map(([name,value])=>name+'='+value).join('; ')};
   if(payload){

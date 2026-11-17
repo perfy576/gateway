@@ -1,5 +1,6 @@
 #include "db.h"
 #include "security.h"
+#include "password_cipher.h"
 #include "protocol.h"
 #include "session_policy.h"
 #include <workflow/WFHttpServer.h>
@@ -25,6 +26,7 @@
 
 using json = nlohmann::json;
 static long long now() { return std::time(nullptr); }
+static long long now_ms() { return std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::system_clock::now().time_since_epoch()).count(); }
 struct HttpError : std::runtime_error {
     int status;
     HttpError(int code, const std::string& message) : std::runtime_error(message), status(code) {}
@@ -59,6 +61,8 @@ struct Config {
 static std::shared_ptr<const Config> config;
 static std::mutex control_mutex;
 static std::string public_host, origin, web_root, state_dir;
+static std::unique_ptr<PasswordCipher> password_cipher;
+static std::atomic<long long> password_key_timestamp{0};
 static long long session_lifetime;
 static std::unordered_map<std::string,std::pair<std::string,std::string>> assets;
 static std::atomic<unsigned> pending{0};
@@ -413,6 +417,21 @@ static void sdk_start(WFHttpTask *task,const Config& c,const std::string& token,
         redirect(task,make_login_request(task,service,login.path,login.protocol));
     }else redirect(task,"https://"+service.host+"/_gateway/start?appid="+appid+"&token="+encode_url(token));
 }
+static json password_payload(WFHttpTask* task,const json& b,const std::string& username,const json& context) {
+    rate_limit("password-envelope:"+ip(task),60);
+    for(const char* field:{"password","passwd","old_password","new_password","confirm_password"})
+        if(b.contains(field))throw HttpError(426,"请升级客户端，使用公钥加密密码");
+    if(!b.contains("password_envelope"))throw HttpError(426,"请升级客户端，使用公钥加密密码");
+    try {
+        return password_cipher->decrypt(text_field(b,"password_envelope",1,65536),origin,username,context,now_ms());
+    } catch(const std::exception&) {throw HttpError(400,"加密密码无效或已过期，请重新提交");}
+}
+static void claim_password_timestamp(const User& user,const json& payload) {
+    const auto timestamp=std::to_string(payload.at("timestamp_ms").get<long long>());
+    db().query("UPDATE users SET last_password_verified_at_ms=? WHERE id=? AND password_hash=? AND enabled=1 AND last_password_verified_at_ms<?",
+        {timestamp,user.id,user.hash,timestamp});
+    if(db().changed()!=1)throw HttpError(409,"密码请求已使用或顺序已过期，请重新提交");
+}
 static User password_user(WFHttpTask *task,const Config& c,const std::string& name,const std::string& pass) {
     rate_limit("login-global",120);rate_limit("login-ip:"+ip(task),15);rate_limit("login-user:"+name,10);
     auto it=c.usernames.find(name);
@@ -445,13 +464,16 @@ static void app_login(WFHttpTask *task,const Config& c,const std::string& query_
         b[key]=value;
     }
     auto appid=text_field(b,"appid",1,64),token=text_field(b,"token",1,16384);
-    auto name=text_field(b,"username",1,64),pass=text_field(b,"passwd",1,256);
+    auto name=text_field(b,"username",1,64);
+    auto payload=password_payload(task,b,name,json::array({"POST","/login",appid,token}));
+    auto pass=text_field(payload.at("passwords"),"password",1,256);
     checked_app_login(c,appid,token);
     auto user=password_user(task,c,name,pass);
     std::lock_guard guard(control_mutex);
     auto live=snapshot();auto login=checked_app_login(*live,appid,token);const auto& service=live->services.at(login.login.service_id);
     auto current=live->users.find(user.id);
     if(current==live->users.end()||current->second.hash!=user.hash||!permitted(service,current->second))throw HttpError(403,"账号已停用或无服务访问权限");
+    claim_password_timestamp(current->second,payload);
     audit(task,user.username,"login.success","appid="+appid);
     {
         std::lock_guard lock(flow_mutex);auto key=sha256(token);auto used=used_login_tokens.find(key);
@@ -702,13 +724,21 @@ static void mutate_user(WFHttpTask *task, const json& b, const std::string& id, 
     static const std::regex pattern("^[a-zA-Z0-9_.-]{1,64}$");
     if (!std::regex_match(username,pattern) || (role!="admin" && role!="user") || !b.contains("enabled") || !b["enabled"].is_boolean())
         throw HttpError(400,"账号或角色格式无效");
-    auto pass=text_field(b,"password",id.empty()?12:0,256); if (!pass.empty() && pass.size()<12) throw HttpError(400,"密码至少 12 个字符");
+    json payload;
+    std::string pass;
+    if(b.contains("password_envelope")||b.contains("password")||id.empty()){
+        const auto path=id.empty()?"/api/admin/users":"/api/admin/users/"+id;
+        payload=password_payload(task,b,actor.username,json::array({id.empty()?"POST":"PUT",path,username}));
+        pass=text_field(payload.at("passwords"),"password",id.empty()?12:0,256);
+    }
+    if (!pass.empty() && pass.size()<12) throw HttpError(400,"密码至少 12 个字符");
     if (!id.empty() && !c->users.count(id)) throw HttpError(404,"用户不存在");
     auto found=c->usernames.find(username);
     if (found!=c->usernames.end() && found->second!=id) throw HttpError(409,"用户名已存在");
     if (id==actor.id && (role!="admin" || !b["enabled"].get<bool>())) throw HttpError(400,"不能停用或降级当前管理员");
     auto& d=db(); d.begin();
     try {
+        if(!payload.is_null())claim_password_timestamp(actor,payload);
         if (id.empty()) d.query("INSERT INTO users(username,display_name,password_hash,role,enabled) VALUES(?,?,?,?,?)",
             {username,name,password_hash(pass),role,b["enabled"].get<bool>()?"1":"0"});
         else {
@@ -740,6 +770,12 @@ static void dispatch(WFHttpTask *task) {
     if(path=="/_gateway/start"&&method=="GET"){sdk_start(task,*c,login_token,params["appid"],true);return;}
     if (path=="/_gateway/callback" && method=="GET") { callback(task,*c,params["flow"],params["ticket"]); return; }
     if (host!=public_host) throw HttpError(404,"该地址不提供控制台");
+    if(path=="/api/public/password-key"&&method=="GET"){
+        rate_limit("password-key:"+ip(task),120);
+        auto timestamp=now_ms(),previous=password_key_timestamp.load();
+        do {timestamp=std::max(timestamp,previous+1);} while(!password_key_timestamp.compare_exchange_weak(previous,timestamp));
+        respond(task,200,{{"jwk",password_cipher->public_key()},{"timestamp_ms",timestamp},{"audience",origin}});return;
+    }
     if((path=="/"||path=="/api/public/notice")&&(method=="GET"||method=="HEAD")){
         json notice=nullptr;
         auto found=c->appids.find(params["appid"]);
@@ -795,14 +831,17 @@ static void dispatch(WFHttpTask *task) {
     }
     if (path=="/api/login" && method=="POST") {
         csrf(task,false); auto b=body(task);
-        auto name=text_field(b,"username",1,64), pass=text_field(b,"password",1,256);
-        auto verified=password_user(task,*c,name,pass);const auto *u=&verified;
+        auto name=text_field(b,"username",1,64);
         std::string request=b.value("token",b.value("request",std::string())), mode=b.value("mode",std::string());
+        auto payload=password_payload(task,b,name,json::array({"POST","/api/login",mode,b.value("appid",std::string()),request}));
+        auto pass=text_field(payload.at("passwords"),"password",1,256);
+        auto verified=password_user(task,*c,name,pass);const auto *u=&verified;
         std::string target="/admin";
         if (mode=="admin") {
             std::lock_guard lock(control_mutex);auto live=snapshot();auto current=live->users.find(u->id);
             if(current==live->users.end()||current->second.hash!=u->hash||!permitted(console_service(*live),current->second))
                 throw HttpError(403,"该账号没有控制台登录权限");
+            claim_password_timestamp(current->second,payload);
             audit(task,u->username,"login.success","scope=admin");new_session(task,*u);
         } else {
             std::lock_guard lock(control_mutex);auto live=snapshot();auto current=live->users.find(u->id);
@@ -810,6 +849,7 @@ static void dispatch(WFHttpTask *task) {
             auto [id,flow]=checked_flow(request);auto s=live->services.find(flow.service_id);
             if (s==live->services.end() || !s->second.enabled || !permitted(s->second,*u)) throw HttpError(403,"无权访问目标服务");
             if(b.contains("appid")&&b.at("appid")!=s->second.appid)throw HttpError(400,"AppID 与登录 Token 不匹配");
+            claim_password_timestamp(current->second,payload);
             audit(task,u->username,"login.success","appid="+s->second.appid);
             target=authorization_url(*live,current->second,request);
         }
@@ -828,12 +868,18 @@ static void dispatch(WFHttpTask *task) {
         }
         if (path=="/api/password" && method=="POST") {
             rate_limit("password:"+u.id,5); auto b=body(task);
-            auto old=text_field(b,"old_password",1,256),pass=text_field(b,"new_password",12,256);
+            auto payload=password_payload(task,b,u.username,json::array({"POST","/api/password"}));
+            auto old=text_field(payload.at("passwords"),"old_password",1,256),pass=text_field(payload.at("passwords"),"new_password",12,256);
             if (!password_verify(old,u.hash)) throw HttpError(400,"当前密码错误");
             std::lock_guard lock(control_mutex);
             auto live=current_user(task,*snapshot());
             if (live.hash!=u.hash) throw HttpError(401,"账号状态已变更，请重新登录");
-            db().query("UPDATE users SET password_hash=? WHERE id=?",{password_hash(pass),u.id});
+            auto& d=db();d.begin();
+            try{
+                claim_password_timestamp(live,payload);
+                d.query("UPDATE users SET password_hash=? WHERE id=?",{password_hash(pass),u.id});
+                d.commit();
+            }catch(...){try{d.rollback();}catch(...){}throw;}
             load_config(); revoke_user(u.id); audit(task,u.username,"password.changed","");
             set_cookie(task,"__Host-gateway_session","",0); respond(task,200,{{"ok",true}}); return;
         }
@@ -993,9 +1039,10 @@ int main() {
         if (env("DB_TLS_REQUIRED","true")=="false")
             std::cerr<<"Database TLS enforcement is disabled by configuration\n";
         bootstrap(); bootstrap_console(); load_config();
+        password_cipher=std::make_unique<PasswordCipher>(env("GATEWAY_PASSWORD_KEY_FILE",state_dir+"/password-private.pem"));
         for (const auto& [name,type]:std::vector<std::pair<std::string,std::string>>{
             {"index.html","text/html; charset=utf-8"},{"app.css","text/css; charset=utf-8"},
-            {"app.js","text/javascript; charset=utf-8"},{"components.js","text/javascript; charset=utf-8"},{"lucide.min.js","text/javascript; charset=utf-8"}}) {
+            {"app.js","text/javascript; charset=utf-8"},{"password-envelope.js","text/javascript; charset=utf-8"},{"components.js","text/javascript; charset=utf-8"},{"lucide.min.js","text/javascript; charset=utf-8"}}) {
             std::ifstream in(web_root+"/"+name,std::ios::binary);
             if (!in) throw std::runtime_error("Missing web asset: "+name);
             assets["/"+name]={type,std::string(std::istreambuf_iterator<char>(in),{})};

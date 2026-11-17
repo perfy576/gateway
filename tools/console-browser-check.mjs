@@ -1,4 +1,5 @@
 import assert from 'node:assert/strict';
+import {protectPasswordBody} from './password-envelope.mjs';
 import {readFileSync} from 'node:fs';
 import {createRequire} from 'node:module';
 import {randomBytes} from 'node:crypto';
@@ -11,6 +12,7 @@ const browser=await chromium.launch({headless:true,executablePath:process.env.CH
 const admin=await request.newContext(),ordinary=await browser.newContext({viewport:{width:390,height:844},locale:'zh-CN'});
 let csrf='',consoleId='',userId='';
 async function api(path,method='GET',data){
+  data=await protectPasswordBody(path,method,data,target=>api(target));
   const r=await admin.fetch(origin+path,{method,data,headers:{Origin:origin,'X-Gateway-Request':'1','X-CSRF-Token':csrf}}).catch(()=>{throw new Error('API network failure: '+path);});
   assert.equal(r.status(),200,'API failed: '+path);return r.json();
 }

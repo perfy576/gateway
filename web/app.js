@@ -25,6 +25,16 @@ function toast(text, failure=false) {
   clearTimeout(toastTimer); toastTimer=setTimeout(()=>node.hidden=true,4000);
 }
 async function api(path, options={}) {
+  if (options.body) {
+    const body=await GatewayPasswordEncryption.protectBody(path,options.method||'GET',JSON.parse(options.body),async target=>{
+      const response=await fetch(target,{credentials:'same-origin',cache:'no-store',redirect:'error'});
+      if(!response.ok)throw new Error('无法获取 Gateway 密码公钥');
+      const result=await response.json();
+      if(target==='/api/public/password-key'&&result.audience!==location.origin)throw new Error('Gateway 密码公钥来源不匹配');
+      return result;
+    },me?.username);
+    options={...options,body:JSON.stringify(body)};
+  }
   const response = await fetch(path, {credentials:'same-origin', ...options, headers:{
     'Content-Type':'application/json','X-Gateway-Request':'1','X-CSRF-Token':csrfToken,...options.headers}});
   const result = await response.json();

@@ -22,11 +22,11 @@ APP_CXXFLAGS = $(CXXFLAGS) -std=c++17 -pthread -Wall -Wextra -Wpedantic
 
 include $(ROOT)/mk/workflow.mk
 
-APP_OBJECTS := $(addprefix $(BUILD_DIR)/obj/,src/main.o src/db.o src/security.o src/protocol.o)
+APP_OBJECTS := $(addprefix $(BUILD_DIR)/obj/,src/main.o src/db.o src/security.o src/protocol.o src/password_cipher.o)
 EXAMPLE_OBJECT := $(BUILD_DIR)/obj/examples/backend-verify.o
 TEST_OBJECT := $(BUILD_DIR)/obj/tests/security.o
 DB_TEST_OBJECT := $(BUILD_DIR)/obj/tests/db.o
-SECURITY_OBJECTS := $(BUILD_DIR)/obj/src/security.o $(BUILD_DIR)/obj/src/protocol.o
+SECURITY_OBJECTS := $(BUILD_DIR)/obj/src/security.o $(BUILD_DIR)/obj/src/protocol.o $(BUILD_DIR)/obj/src/password_cipher.o
 OBJECTS := $(APP_OBJECTS) $(EXAMPLE_OBJECT) $(TEST_OBJECT) $(DB_TEST_OBJECT)
 
 .PHONY: all deps examples test check test-db install clean help

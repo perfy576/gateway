@@ -1,4 +1,5 @@
 import assert from 'node:assert/strict';
+import {protectPasswordBody} from './password-envelope.mjs';
 import http from 'node:http';
 import {readFileSync} from 'node:fs';
 import {randomBytes,createHash} from 'node:crypto';
@@ -15,6 +16,7 @@ const browserAgent='Mozilla/5.0 (iPhone; CPU iPhone OS 18_0 like Mac OS X) Versi
 const appHeaders={'User-Agent':agent,'X-Gateway-App-Package':packageName};
 const cookieFor=domain=>[...(jars.get(domain)||new Map())].map(([k,v])=>k+'='+v).join('; ');
 async function request(path,{domain=gateway,method='GET',body,headers={}}={}){
+  body=await protectPasswordBody(path,method,body,async target=>(await request(target)).json);
   const encoded=body===undefined?undefined:Buffer.from(JSON.stringify(body));
   const outgoing={Host:domain,Cookie:cookieFor(domain),...headers};
   if(encoded)Object.assign(outgoing,{'Content-Type':'application/json','Content-Length':encoded.length,Origin:origin,'X-Gateway-Request':'1','X-CSRF-Token':csrf});

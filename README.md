@@ -2,7 +2,7 @@
 
 SDK 推荐使用 `checkCookie(request, appid, secret, 是否302, 是否允许在线回退)`，Python 包名为 `gateway_sdk`，C++ 命名空间为 `gateway::sdk`，静态库为 `libgateway_sdk.a`。返回结构中的 `result` 只有 `Ok` 和 `redictionToLogin`，原因放 `error`，失败登录地址放 `redictUrl`。完整用法见 [SDK 文档](../gateway-sdk/README.md)。
 
-SDK 登录请求通过 `/login?appid=...&token=...` 携带签名保护的 AppID、返回地址、时间戳、有效期和版本能力；网关协商后进入统一登录页，页面上的目标服务无法修改。`POST /login` 提供无需浏览器跳转的 App 登录，参数为 `appid`、`username`、`passwd`、`token`，成功返回 `{"result":"Ok","retmsg":"登录成功","cookie":"..."}`，失败返回 `Failed`、原因和空 Cookie。Token 可由 SDK 的 `createLoginToken(appid, secret, uri)` 生成，成功消费一次；完整接口说明见 SDK 文档。
+SDK 登录请求通过 `/login?appid=...&token=...` 携带签名保护的 AppID、返回地址、时间戳、有效期和版本能力；网关协商后进入统一登录页，页面上的目标服务无法修改。`POST /login` 提供无需浏览器跳转的 App 登录，参数为 `appid`、`username`、`password_envelope`、`token`，成功返回 `{"result":"Ok","retmsg":"登录成功","cookie":"..."}`，失败返回 `Failed`、原因和空 Cookie。密码通过 Gateway 公钥加密的 JWE 传输，不能再传明文 `passwd`。Token 可由 SDK 的 `createLoginToken(appid, secret, uri)` 生成，成功消费一次；完整接口说明见 SDK 文档。
 
 C++17 + 搜狗 Workflow 的认证网关，前端是原生 HTML / CSS / JavaScript。无 Node、Python、Java 或 Go 应用运行时。现有 Caddy 负责 TLS 和流式反向代理；C++ 负责每次请求的认证、路由选择和 JWT 签发。
 
@@ -62,6 +62,8 @@ sequenceDiagram
 ```
 
 - 密码：OpenSSL scrypt，独立随机盐，`N=16384, r=8, p=1`。
+- 密码传输：浏览器及 Flutter 使用 `RSA-OAEP-256` + `A256GCM` 的 JWE，加密账号、密码、毫秒时间戳、Gateway origin 和用途；HTTPS 仍必须保留。GET `/api/public/password-key` 返回公钥 JWK、服务端 `timestamp_ms` 和 `audience`，每次提交重新获取，不缓存时间戳。原始密码字段（包括与密文混传）返回 426。网页修改密码、管理员设置密码也使用加密信封；无密码的用户资料编辑不需信封。
+- 密码防重放：验密与授权通过后，用 MySQL 条件更新 `users.last_password_verified_at_ms`，仅接受严格大于已验证值的时间戳，并检查过去 2 分钟、未来 30 秒的时间窗口。并发重复请求仅一个成功，其余返回 409；错误密码不推进时间戳。状态持久化，重启后仍拒绝旧请求。账号在多个设备或接口上并发登录时，先完成的新时间戳可能使较早请求过期，此时重新提交会获取新时间戳。
 - 会话：256 位密码学随机凭据，值为 `v1.<64位hex>`，内存只记录 SHA-256 摘要；控制台及业务有效期都由域名单独设置，`GATEWAY_SESSION_SECONDS` 仅用于首次创建内置控制台时的默认值。Cookie 使用 `__Host-`、`Secure`、`HttpOnly`、`SameSite=Lax`，无共享 Domain。登录态还绑定独立的 `__Host-gateway_binding` Cookie、业务 ID 和域名。后端访问 JWT 最长 60 秒，也不会超过当前业务会话的到期时间。
 - 登录请求：HS256 签名，包含 `ver=1`、`type=login_request`、`appid`、`service_id`、完整 `return_url`、`iat`、`exp`、`jti`，5 分钟过期；JWT 头包含 `gwv=1`。内存同时保存对应摘要和目标信息。浏览器请求使用服务 Secret 通过 `gateway/browser-login/v1` 派生的密钥；SDK 请求使用独立上下文 `gateway/sdk-login/v1`，防止混用。重启后浏览器流程和已签发会话失效。
 - 回跳：一次性随机 ticket，30 秒过期，绑定原浏览器、服务和登录请求；消费后删除。
@@ -153,6 +155,7 @@ make test
 - 页面资源：`/opt/gateway/web/`，本地静态资源，没有 CDN 运行依赖
 - 环境配置：`/etc/gateway.env`，权限 0600；新部署可参考 `deploy/gateway.env.example`，不要将真实凭据加入 Git
 - 初始密码：`/var/lib/gateway/initial-admin.txt`，权限 0600
+- 密码解密私钥：默认 `/var/lib/gateway/password-private.pem`，首次启动生成 RSA-3072，权限 0600；可用 `GATEWAY_PASSWORD_KEY_FILE` 指定。重启复用已有私钥，禁止放入网页目录、日志或 Git；加载时拒绝符号链接及宽松权限。
 - Caddy：`/etc/caddy/Caddyfile` 和 `/etc/caddy/gateway.caddy`
 - 原 Caddy 配置备份：`/etc/caddy/Caddyfile.before-gateway-20261116`
 
@@ -198,5 +201,9 @@ make test
 `tools/integration.mjs` 对实际 Caddy 和网关运行端到端测试，临时创建测试服务，检查多服务路由、独立密钥、登录、签名请求、回跳防重放、公开路径、身份头覆盖、JWT、SSE、WebSocket 和退出撤销。设置 `GATEWAY_TEST_RESTART=1` 可额外检查重启后的会话清空和 MySQL 配置保留，这会重启线上网关。最终 23 项检查已通过，临时服务和用户已清理。
 
 `tools/app-login-integration.mjs` 验证自定义 AppID、Secret 轮换、两套 SDK 的接口登录、错误响应、一次性消费、服务隔离、权限和限流。与其他线上联调脚本顺序运行，避免测试账号的退出或限流互相干扰。
+
+升级加密密码协议时，管理员先执行 `migrations/005-encrypted-password.sql`，再同步更新二进制、全部网页资源和 Flutter SDK 2.0.0/App。旧明文登录客户端不再兼容，现有 Cookie 验证协议不变。测试夹具中的私钥只用于测试，不能配置为运行私钥。
+
+`DART_BIN=/path/to/dart GATEWAY_TEST_PORT=19095 node tools/encrypted-password-integration.mjs` 验证 Web Crypto、Dart JOSE 与 C++ OpenSSL 互通、并发和递增时间戳、跨接口重放、密文篡改、时间窗口、明文拒绝及加密密码修改。指定端口应是独立测试实例，脚本创建的账号、服务和会话会清理。
 
 `tools/browser-check.mjs` 使用 Playwright 检查桌面/手机页面、管理操作和自定义控件；`tools/business-browser-check.mjs` 检查业务登录页的只读目标及真实浏览器跨域回跳。后者为虚拟测试域名启动本地 TLS relay，不改变生产 DNS。两组浏览器检查均已通过。测试需要本机初始管理员凭据副本 `.secrets/initial-admin.txt`，并会产生测试审计记录；页面截图和测试结果在 `artifacts/`。`PLAYWRIGHT_MODULE`、`CHROMIUM_PATH` 可指定测试工具路径。
