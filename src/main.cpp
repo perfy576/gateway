@@ -270,6 +270,15 @@ static User current_user(WFHttpTask *task, const Config& c, bool required=true) 
     if (required) throw HttpError(401,"请先登录");
     return {"","","","","",false};
 }
+static User authenticate_console_session(WFHttpTask *task, const Config& c) {
+    auto user=current_user(task,c,false);
+    if (user.id.empty()) {
+        ++auth_rejected;
+        throw HttpError(401,"请先登录");
+    }
+    ++auth_granted;
+    return user;
+}
 static void revoke_user(const std::string& id) {
     {
         std::unique_lock lock(session_mutex);
@@ -853,11 +862,11 @@ static void dispatch(WFHttpTask *task) {
         respond(task,200,{{"redirect",target}}); return;
     }
     if (path=="/api/me" && method=="GET") {
-        auto u=current_user(task,*c);
+        auto u=authenticate_console_session(task,*c);
         respond(task,200,{{"user",user_json(u)},{"csrf",sha256("csrf:"+cookie(task,"__Host-gateway_session"))}}); return;
     }
     if (path.rfind("/api/",0)==0) {
-        auto u=current_user(task,*c); bool write=method!="GET";
+        auto u=authenticate_console_session(task,*c); bool write=method!="GET";
         if (write) csrf(task,true);
         if (path=="/api/logout" && method=="POST") {
             revoke_user(u.id); set_cookie(task,"__Host-gateway_session","",0); audit(task,u.username,"logout","");
@@ -992,22 +1001,41 @@ static void process(WFHttpTask *task) {
     r->set_header_pair("X-Frame-Options","DENY");
     r->set_header_pair("Content-Security-Policy","default-src 'self'; script-src 'self'; style-src 'self'; img-src 'self' data:; font-src 'self'; connect-src 'self'; frame-ancestors 'none'; base-uri 'none'; form-action 'self'");
     auto path=std::string(task->get_req()->get_request_uri()); path=path.substr(0,path.find('?'));
-    bool slow=(path=="/login"&&std::string(task->get_req()->get_method())=="POST") || path=="/api/login" || path=="/api/login/quick" || path=="/api/logout" || path=="/api/password" || path.rfind("/api/admin/",0)==0;
-    if (!slow) {
+    const std::string method=task->get_req()->get_method();
+    const bool callback_request=method=="GET" && path=="/_gateway/callback";
+    const bool auth_request=callback_request ||
+        (method=="GET" && (path=="/internal/auth" || path=="/internal/nginx-auth")) ||
+        (method=="POST" && (path=="/login" || path=="/api/login" || path=="/api/login/quick" || path=="/verify"));
+    const bool slow=(path=="/login" && method=="POST") || path=="/api/login" || path=="/api/login/quick" ||
+        path=="/api/logout" || path=="/api/password" || path.rfind("/api/admin/",0)==0;
+    auto handle=[task,auth_request,callback_request] {
         safely(task);
-        if ((path=="/internal/auth" || path=="/internal/nginx-auth") && std::string(task->get_req()->get_method())=="GET") {
-            // Count the final result, including errors handled by safely().
-            if (std::string(r->get_status_code())=="200") ++auth_granted;
-            else ++auth_rejected;
+        if (!auth_request) return;
+        auto *response=task->get_resp();
+        const std::string status=response->get_status_code();
+        bool granted=status=="200";
+        if (callback_request && status=="302") {
+            // A disabled service also redirects, but does not issue a session.
+            protocol::HttpHeaderCursor headers(response);
+            std::string reason;
+            granted=!headers.find("X-Gateway-Redirect-Reason",reason);
         }
+        if (granted) ++auth_granted;
+        else ++auth_rejected;
+    };
+    if (!slow) {
+        handle();
         return;
     }
     if (pending.fetch_add(1)>=128) {
-        --pending; respond_error(task,503,"服务繁忙，请稍后重试"); return;
+        --pending;
+        if (auth_request) ++auth_rejected;
+        respond_error(task,503,"服务繁忙，请稍后重试");
+        return;
     }
     static std::atomic<unsigned> queue{0};
-    *series_of(task) << WFTaskFactory::create_go_task("gateway-control-"+std::to_string(queue++%8),[task] {
-        safely(task); --pending;
+    *series_of(task) << WFTaskFactory::create_go_task("gateway-control-"+std::to_string(queue++%8),[handle] {
+        handle(); --pending;
     });
 }
 static void bootstrap() {
