@@ -16,5 +16,5 @@ bool valid_path(const std::string& path);
 struct Upstream { std::string scheme, address, hostname; };
 Upstream parse_upstream(const std::string& value);
 std::string base64url(const std::string& value);
-std::string sign_jwt(const nlohmann::json& claims, const std::string& secret);
+std::string sign_jwt(const nlohmann::json& claims, const std::string& secret, std::string* encoded_payload = nullptr);
 nlohmann::json verify_jwt(const std::string& token, const std::string& secret, const std::string& issuer, const std::string& audience);

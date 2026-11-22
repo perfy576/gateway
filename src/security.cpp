@@ -109,13 +109,23 @@ std::string base64url(const std::string& value) {
     std::replace(output.begin(), output.end(), '/', '_');
     return output;
 }
-std::string sign_jwt(const nlohmann::json& claims, const std::string& secret) {
-    nlohmann::json header={{"alg","HS256"},{"typ","JWT"},{"gwv",claims.value("ver",1)}};
-    std::string input = base64url(header.dump()) + "." + base64url(claims.dump());
+static std::string jwt_prefix(int version) {
+    nlohmann::json header={{"alg","HS256"},{"typ","JWT"},{"gwv",version}};
+    return base64url(header.dump()) + ".";
+}
+std::string sign_jwt(const nlohmann::json& claims, const std::string& secret, std::string* encoded_payload) {
+    static const std::string v1_prefix = jwt_prefix(1);
+    const int version = claims.value("ver",1);
+    auto payload = base64url(claims.dump());
+    std::string input = version == 1 ? v1_prefix : jwt_prefix(version);
+    input += payload;
     unsigned char digest[EVP_MAX_MD_SIZE]; unsigned length = 0;
     if (!HMAC(EVP_sha256(), secret.data(), secret.size(), reinterpret_cast<const unsigned char *>(input.data()),
           input.size(), digest, &length)) throw std::runtime_error("HMAC failed");
-    return input + "." + base64url(std::string(reinterpret_cast<char *>(digest), length));
+    input += ".";
+    input += base64url(std::string(reinterpret_cast<char *>(digest), length));
+    if (encoded_payload) *encoded_payload = std::move(payload);
+    return input;
 }
 nlohmann::json verify_jwt(const std::string& token, const std::string& secret, const std::string& issuer, const std::string& audience) {
     if (token.empty() || token.size()>16384) throw std::invalid_argument("Invalid token size");

@@ -36,7 +36,11 @@ int main() {
         {"request_method","GET"},{"request_uri_sha256",sha256("/private?x=1")},
         {"ver",1},{"type","gateway_access"},{"cookie_version",1},{"cookie_name",BINDING_COOKIE},{"cookie_sha256",sha256(binding)},{"sid",random_hex()}};
     auto verify=[&](const std::string& token){return verifier.verify(token,"GET","/private?x=1",cookies);};
-    auto token=sign_jwt(claims,secret); auto identity=verify(token);
+    std::string encoded_payload;
+    auto token=sign_jwt(claims,secret,&encoded_payload); auto identity=verify(token);
+    auto prefix=base64url(R"({"alg":"HS256","gwv":1,"typ":"JWT"})")+".";
+    require(encoded_payload==base64url(claims.dump()) && token.rfind(prefix+encoded_payload+".",0)==0,"User info matches the signed v1 payload");
+    require(sign_jwt(claims,secret)==token,"Same claims and secret produce the same token");
     require(identity.authenticated && identity.user_id=="1" && identity.username=="admin","JWT interoperability");
     rejects([&]{verify(sign_jwt(claims,random_hex()));});
     auto modified=claims; modified["aud"]="wrong.example.com"; rejects([&]{verify(sign_jwt(modified,secret));});

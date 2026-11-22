@@ -117,6 +117,7 @@ try{
   assert.equal(deniedApp.status,403,'App login must enforce the business allowlist');assert.equal(deniedApp.json.cookie,'');
   assert.equal((await browserLogin(a,deniedFlow,ordinary,ordinaryPassword)).status,302);
   const userAuth=await auth(a);assert.equal(userAuth.status,200);assert.equal(userAuth.headers['x-gateway-user'],ordinary);
+  assert.equal(userAuth.headers['x-gateway-user-info'],userAuth.headers['x-gateway-token'].split('.')[1],'Forward the signed payload as user info');
   const online=()=>request('/verify',{method:'POST',headers:{Authorization:'Bearer '+credentialsA.verification_key},body:{audience:a.host,token:userAuth.headers['x-gateway-token'],cookie:userAuth.headers['x-gateway-cookie'],method:'GET',uri:'/private?x=1'}});
   assert.equal((await online()).status,200);
   a.users=[];await api('/api/admin/services/'+ids[0],'PUT',a);
