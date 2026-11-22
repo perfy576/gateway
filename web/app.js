@@ -126,11 +126,20 @@ function searchTools(count) {
   return `<div class="table-tools"><div class="search">${icon('search')}<input id="search" value="${esc(search)}" placeholder="搜索${view==='services'?'域名或服务':'用户'}" aria-label="搜索"></div><div class="actions"><span class="muted">共 ${count} 项</span>${iconButton('refresh-cw','刷新','refresh')}</div></div>`;
 }
 function duration(seconds) {return seconds<60?`${seconds} 秒`:seconds<3600?`${Math.floor(seconds/60)} 分钟`:seconds<86400?`${Math.floor(seconds/3600)} 小时`:`${Math.floor(seconds/86400)} 天`;}
+function authRequestStat(metrics) {
+  const total=metrics.auth_requests.toLocaleString();
+  const success=metrics.auth_granted.toLocaleString();
+  const failure=metrics.auth_rejected.toLocaleString();
+  return `<div class="stat"><label>认证请求 · 总计 ${total}</label>
+    <strong><span class="auth-granted" title="成功"><span class="auth-stat-label">成功 </span>${success}</span>
+    <span aria-hidden="true">&#92;</span>
+    <span class="auth-rejected" title="失败"><span class="auth-stat-label">失败 </span>${failure}</span></strong></div>`;
+}
 function renderServices() {
   const list=sortedServices(state.services).filter(s=>`${s.name} ${s.host} ${s.upstream}`.toLowerCase().includes(search.toLowerCase()));
   const add=`<button class="primary" data-action="edit-service">${icon('plus')}添加域名</button>`;
   const rows=list.map(s=>`<tr><td class="name">${esc(s.name)}${s.builtin?'<span class="builtin-label">内置</span>':''}<div class="subtext mono"><a class="service-domain" href="https://${esc(s.host)}/${s.builtin?'admin':''}" target="_blank" rel="noopener noreferrer">${esc(s.host)}${icon('arrow-up-right')}</a></div></td><td class="mono">${s.builtin?'内置控制台':esc(s.upstream)}</td><td>${s.cookie_max_age_hours===0?'无限':esc(Number(s.cookie_max_age_hours.toFixed(6)))+' 小时'}</td><td><span class="badge neutral">${s.builtin?'—':s.excluded_paths.length+' 条规则'}</span></td><td><button type="button" class="service-status" role="switch" aria-checked="${s.enabled}" aria-label="${esc(s.name)}启用状态" title="${s.builtin?'内置控制台始终启用':s.enabled?'停用服务':'启用服务'}" data-action="toggle-service" data-id="${esc(s.id)}" ${s.builtin?'disabled':''}><span class="status-track" aria-hidden="true"></span><span>${s.enabled?'已启用':'已停用'}</span></button></td><td><div class="actions">${s.builtin?'':iconButton('key-round','后端签名密钥','service-secret',s.id)}${iconButton('pencil','编辑服务','edit-service',s.id)}${s.builtin?'':iconButton('trash-2','删除服务','delete-service',s.id)}</div></td></tr>`).join('');
-  return pageHeading(add)+`<div class="stats"><div class="stat"><label>接入域名</label><strong>${state.services.length}</strong></div><div class="stat"><label>已启用服务</label><strong>${state.services.filter(s=>s.enabled).length}</strong></div><div class="stat"><label>在线 / 有效会话</label><strong>${state.metrics.online_sessions} / ${state.metrics.valid_sessions}</strong></div><div class="stat"><label>认证请求</label><strong>${state.metrics.auth_requests.toLocaleString()}</strong></div></div>`+searchTools(list.length)+(list.length?table(['服务 / 域名','后端地址','Cookie 有效期','免登录路径','状态','操作'],rows):empty(search?'没有匹配的服务':'暂无接入域名','network',search?'':add))+`<div class="table-footer">进程已运行 ${duration(state.metrics.uptime_seconds)}</div>`;
+  return pageHeading(add)+`<div class="stats"><div class="stat"><label>接入域名</label><strong>${state.services.length}</strong></div><div class="stat"><label>已启用服务</label><strong>${state.services.filter(s=>s.enabled).length}</strong></div><div class="stat"><label>在线 / 有效会话</label><strong>${state.metrics.online_sessions} / ${state.metrics.valid_sessions}</strong></div>${authRequestStat(state.metrics)}</div>`+searchTools(list.length)+(list.length?table(['服务 / 域名','后端地址','Cookie 有效期','免登录路径','状态','操作'],rows):empty(search?'没有匹配的服务':'暂无接入域名','network',search?'':add))+`<div class="table-footer">进程已运行 ${duration(state.metrics.uptime_seconds)}</div>`;
 }
 function renderUsers() {
   const list=sorted(state.users).filter(u=>`${u.username} ${u.display_name}`.toLowerCase().includes(search.toLowerCase()));

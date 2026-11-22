@@ -66,7 +66,7 @@ static std::atomic<long long> password_key_timestamp{0};
 static long long session_lifetime;
 static std::unordered_map<std::string,std::pair<std::string,std::string>> assets;
 static std::atomic<unsigned> pending{0};
-static std::atomic<unsigned long long> auth_requests{0}, auth_granted{0}, auth_rejected{0};
+static std::atomic<unsigned long long> auth_granted{0}, auth_rejected{0};
 static const long long started = now();
 
 struct ClientProtocol {
@@ -489,10 +489,9 @@ static void app_login(WFHttpTask *task,const Config& c,const std::string& query_
         {"cookie","__Host-gateway_session="+session+"; "+BINDING_COOKIE+"="+binding}});
 }
 static void authenticate(WFHttpTask *task, bool nginx) {
-    ++auth_requests;
     auto c=snapshot();
     auto host=header(task,"X-Forwarded-Host"), uri=header(task,"X-Forwarded-Uri");
-    if(redirect_disabled_service(task,*c,host,header(task,"X-Forwarded-Method"),nginx)){++auth_rejected;return;}
+    if(redirect_disabled_service(task,*c,host,header(task,"X-Forwarded-Method"),nginx))return;
     auto& s=service_by_host(*c,host);
     if (!valid_path(uri)) throw HttpError(400,"请求地址无效");
     auto user=current_user(task,*c,false);
@@ -514,7 +513,6 @@ static void authenticate(WFHttpTask *task, bool nginx) {
         if(found!=sessions.end()){found->second.cookie_lifetime=s.cookie_lifetime;found->second.cookie_refreshed=now();}
     }
     if (user.id.empty() && !excluded_path(s,uri)) {
-        ++auth_rejected;
         std::string login=make_login_request(task,s,uri);
         task->get_resp()->set_header_pair("X-Gateway-Login",login);
         auto method=header(task,"X-Forwarded-Method");
@@ -548,7 +546,6 @@ static void authenticate(WFHttpTask *task, bool nginx) {
     resp->set_header_pair("X-Gateway-User-Id",user.id);
     resp->set_header_pair("X-Gateway-Role",user.role);
     resp->set_header_pair("X-Gateway-User-Info",base64url(claims.dump()));
-    ++auth_granted;
 }
 static void verify_backend_request(WFHttpTask *task,const Config& c) {
     if(header(task,"Content-Type").rfind("application/json",0)!=0)throw HttpError(400,"Expected application/json");
@@ -890,9 +887,10 @@ static void dispatch(WFHttpTask *task) {
             for (const auto& [id,user]:c->users) users.push_back(user_json(user));
             auto active_sessions=session_list(*c);
             auto online=std::count_if(active_sessions.begin(),active_sessions.end(),[](const json& s){return s["online"].get<bool>();});
+            const auto granted=auth_granted.load(), rejected=auth_rejected.load();
             respond(task,200,{{"services",services},{"users",users},{"sessions",active_sessions},
-                {"metrics",{{"uptime_seconds",now()-started},{"auth_requests",auth_requests.load()},
-                {"auth_granted",auth_granted.load()},{"auth_rejected",auth_rejected.load()},
+                {"metrics",{{"uptime_seconds",now()-started},{"auth_requests",granted+rejected},
+                {"auth_granted",granted},{"auth_rejected",rejected},
                 {"online_sessions",online},{"valid_sessions",active_sessions.size()}}}}); return;
         }
         if (path=="/api/admin/audit" && method=="GET") {
@@ -995,7 +993,15 @@ static void process(WFHttpTask *task) {
     r->set_header_pair("Content-Security-Policy","default-src 'self'; script-src 'self'; style-src 'self'; img-src 'self' data:; font-src 'self'; connect-src 'self'; frame-ancestors 'none'; base-uri 'none'; form-action 'self'");
     auto path=std::string(task->get_req()->get_request_uri()); path=path.substr(0,path.find('?'));
     bool slow=(path=="/login"&&std::string(task->get_req()->get_method())=="POST") || path=="/api/login" || path=="/api/login/quick" || path=="/api/logout" || path=="/api/password" || path.rfind("/api/admin/",0)==0;
-    if (!slow) { safely(task); return; }
+    if (!slow) {
+        safely(task);
+        if ((path=="/internal/auth" || path=="/internal/nginx-auth") && std::string(task->get_req()->get_method())=="GET") {
+            // Count the final result, including errors handled by safely().
+            if (std::string(r->get_status_code())=="200") ++auth_granted;
+            else ++auth_rejected;
+        }
+        return;
+    }
     if (pending.fetch_add(1)>=128) {
         --pending; respond_error(task,503,"服务繁忙，请稍后重试"); return;
     }
