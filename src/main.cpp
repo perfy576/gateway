@@ -19,6 +19,7 @@
 #include <mutex>
 #include <regex>
 #include <shared_mutex>
+#include <string_view>
 #include <thread>
 #include <unordered_set>
 #include <fcntl.h>
@@ -66,7 +67,14 @@ static std::atomic<long long> password_key_timestamp{0};
 static long long session_lifetime;
 static std::unordered_map<std::string,std::pair<std::string,std::string>> assets;
 static std::atomic<unsigned> pending{0};
-static std::atomic<unsigned long long> auth_granted{0}, auth_rejected{0};
+struct RequestCounts {
+    std::atomic<unsigned long long> success{0}, failure{0};
+    void record(bool accepted) {
+        auto& count=accepted ? success : failure;
+        count.fetch_add(1,std::memory_order_relaxed);
+    }
+};
+static RequestCounts login_counts, verification_counts;
 static const long long started = now();
 
 struct ClientProtocol {
@@ -272,11 +280,8 @@ static User current_user(WFHttpTask *task, const Config& c, bool required=true) 
 }
 static User authenticate_console_session(WFHttpTask *task, const Config& c) {
     auto user=current_user(task,c,false);
-    if (user.id.empty()) {
-        ++auth_rejected;
-        throw HttpError(401,"请先登录");
-    }
-    ++auth_granted;
+    verification_counts.record(!user.id.empty());
+    if (user.id.empty()) throw HttpError(401,"请先登录");
     return user;
 }
 static void revoke_user(const std::string& id) {
@@ -521,7 +526,9 @@ static void authenticate(WFHttpTask *task, bool nginx) {
         std::unique_lock lock(session_mutex);auto found=sessions.find(session_key(task));
         if(found!=sessions.end()){found->second.cookie_lifetime=s.cookie_lifetime;found->second.cookie_refreshed=now();}
     }
-    if (user.id.empty() && !excluded_path(s,uri)) {
+    const bool session_required=!excluded_path(s,uri);
+    if (!user.id.empty() || session_required) verification_counts.record(!user.id.empty());
+    if (user.id.empty() && session_required) {
         std::string login=make_login_request(task,s,uri);
         task->get_resp()->set_header_pair("X-Gateway-Login",login);
         auto method=header(task,"X-Forwarded-Method");
@@ -896,10 +903,18 @@ static void dispatch(WFHttpTask *task) {
             for (const auto& [id,user]:c->users) users.push_back(user_json(user));
             auto active_sessions=session_list(*c);
             auto online=std::count_if(active_sessions.begin(),active_sessions.end(),[](const json& s){return s["online"].get<bool>();});
-            const auto granted=auth_granted.load(), rejected=auth_rejected.load();
+            const auto login_success=login_counts.success.load(std::memory_order_relaxed);
+            const auto login_failure=login_counts.failure.load(std::memory_order_relaxed);
+            const auto verification_success=verification_counts.success.load(std::memory_order_relaxed);
+            const auto verification_failure=verification_counts.failure.load(std::memory_order_relaxed);
+            const auto granted=login_success+verification_success, rejected=login_failure+verification_failure;
             respond(task,200,{{"services",services},{"users",users},{"sessions",active_sessions},
                 {"metrics",{{"uptime_seconds",now()-started},{"auth_requests",granted+rejected},
                 {"auth_granted",granted},{"auth_rejected",rejected},
+                {"login_requests",login_success+login_failure},
+                {"login_success",login_success},{"login_failure",login_failure},
+                {"verification_requests",verification_success+verification_failure},
+                {"verification_success",verification_success},{"verification_failure",verification_failure},
                 {"online_sessions",online},{"valid_sessions",active_sessions.size()}}}}); return;
         }
         if (path=="/api/admin/audit" && method=="GET") {
@@ -1002,26 +1017,14 @@ static void process(WFHttpTask *task) {
     r->set_header_pair("Content-Security-Policy","default-src 'self'; script-src 'self'; style-src 'self'; img-src 'self' data:; font-src 'self'; connect-src 'self'; frame-ancestors 'none'; base-uri 'none'; form-action 'self'");
     auto path=std::string(task->get_req()->get_request_uri()); path=path.substr(0,path.find('?'));
     const std::string method=task->get_req()->get_method();
-    const bool callback_request=method=="GET" && path=="/_gateway/callback";
-    const bool auth_request=callback_request ||
-        (method=="GET" && (path=="/internal/auth" || path=="/internal/nginx-auth")) ||
-        (method=="POST" && (path=="/login" || path=="/api/login" || path=="/api/login/quick" || path=="/verify"));
+    const bool login_request=method=="POST" && (path=="/login" || path=="/api/login" || path=="/api/login/quick");
+    const bool online_verification=method=="POST" && path=="/verify";
     const bool slow=(path=="/login" && method=="POST") || path=="/api/login" || path=="/api/login/quick" ||
         path=="/api/logout" || path=="/api/password" || path.rfind("/api/admin/",0)==0;
-    auto handle=[task,auth_request,callback_request] {
+    auto handle=[task,login_request,online_verification] {
         safely(task);
-        if (!auth_request) return;
-        auto *response=task->get_resp();
-        const std::string status=response->get_status_code();
-        bool granted=status=="200";
-        if (callback_request && status=="302") {
-            // A disabled service also redirects, but does not issue a session.
-            protocol::HttpHeaderCursor headers(response);
-            std::string reason;
-            granted=!headers.find("X-Gateway-Redirect-Reason",reason);
-        }
-        if (granted) ++auth_granted;
-        else ++auth_rejected;
+        if (login_request) login_counts.record(std::string_view(task->get_resp()->get_status_code())=="200");
+        if (online_verification) verification_counts.record(std::string_view(task->get_resp()->get_status_code())=="200");
     };
     if (!slow) {
         handle();
@@ -1029,7 +1032,7 @@ static void process(WFHttpTask *task) {
     }
     if (pending.fetch_add(1)>=128) {
         --pending;
-        if (auth_request) ++auth_rejected;
+        if (login_request) login_counts.record(false);
         respond_error(task,503,"服务繁忙，请稍后重试");
         return;
     }

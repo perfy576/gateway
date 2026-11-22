@@ -54,6 +54,24 @@ try{
     await new Promise(resolve=>setTimeout(resolve,200));
   }
   await api('/api/login','POST',{username,password,mode:'admin'});const me=await api('/api/me');csrf=me.csrf;
+  const metrics=async()=>(await api('/api/admin/state')).metrics;
+  async function checkCounts(before, {loginSuccess=0,loginFailure=0,verificationSuccess=0,verificationFailure=0}={}) {
+    const after=await metrics();
+    assert.equal(after.login_success-before.login_success,loginSuccess);
+    assert.equal(after.login_failure-before.login_failure,loginFailure);
+    // Reading admin state itself performs a successful Cookie check.
+    assert.equal(after.verification_success-before.verification_success,verificationSuccess+1);
+    assert.equal(after.verification_failure-before.verification_failure,verificationFailure);
+    assert.equal(after.login_requests,after.login_success+after.login_failure);
+    assert.equal(after.verification_requests,after.verification_success+after.verification_failure);
+    return after;
+  }
+  let counts=await metrics();
+  assert(counts.login_success>=1,'Console sign-in must count as a successful login');
+  assert.equal((await request('/api/login',{method:'POST',body:{}})).status,400);
+  counts=await checkCounts(counts,{loginFailure:1});
+  assert.equal((await request('/api/me',{headers:{Cookie:'__Host-gateway_session=invalid'}})).status,401);
+  await checkCounts(counts,{verificationFailure:1});
   for(const config of configs)ids.push((await api('/api/admin/services','POST',config)).id);
   const a=configs[0],b=configs[1];
   for(const value of [-1,'12',true,876001]){
@@ -63,7 +81,10 @@ try{
   assert.equal((await request(loginA.pathname+loginA.search)).status,200,'Console login must not authorize a business');
   const authorize=await request('/authorize'+loginA.search);assert.equal(authorize.status,302);assert.equal(new URL(authorize.headers.location).pathname,'/login');
   assert.equal((await auth(a,{Cookie:consoleCookies})).status,302,'Console cookie copied to a business must fail');
+  counts=await metrics();
   const signedInA=await browserLogin(a,loginA);assert.equal(signedInA.status,302);
+  await checkCounts(counts,{loginSuccess:1});
+  console.log('PASS login and Cookie checks are counted independently; callback is not counted twice');
   assert(signedInA.headers['set-cookie'].filter(c=>/gateway_(session|binding)=/.test(c)).every(c=>c.includes('Max-Age=1800')));
   assert(cookieFor(gateway)===consoleCookies,'Business login replaced the console cookies');assert.equal((await api('/api/me')).user.id,me.user.id);
   assert.equal((await auth(a)).status,200);assert.equal((await auth(b,{Cookie:cookieFor(a.host)})).status,302);
